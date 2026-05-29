@@ -4,7 +4,7 @@ set -euo pipefail
 exec > /var/log/bradly-bootstrap.log 2>&1
 echo "[bradly] bootstrap $(date -Is)"
 
-BUNDLE_URL="${BRADLY_BUNDLE_URL:-}"
+BUNDLE_URL="${BRADLY_BUNDLE_URL:-https://raw.githubusercontent.com/Branden83/bradly-server-bundle/main/bradly-server.tgz}"
 JWT_SECRET="${JWT_SECRET:-$(openssl rand -hex 32)}"
 
 apt-get update -qq
