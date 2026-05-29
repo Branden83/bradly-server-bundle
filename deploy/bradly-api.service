@@ -1,0 +1,18 @@
+[Unit]
+Description=Bradly API Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/bradly/server
+Environment=NODE_ENV=production
+Environment=PORT=3847
+Environment=JWT_SECRET=CHANGE_ME_ON_DEPLOY
+Environment=BRADLY_DB_PATH=/opt/bradly/data/bradly.db
+ExecStart=/usr/bin/node index.js
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
