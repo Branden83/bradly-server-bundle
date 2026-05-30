@@ -11,15 +11,15 @@ const homeId = uuid();
 db.prepare(
   `INSERT OR IGNORE INTO users (id, email, password_hash, display_name, role)
    VALUES (?, ?, ?, ?, ?)`
-).run(ownerId, 'owner@bradly.demo', passwordHash, 'Demo Owner', 'client');
+).run(ownerId, 'owner@bradley.demo', passwordHash, 'Demo Owner', 'client');
 
 db.prepare(
   `INSERT OR IGNORE INTO users (id, email, password_hash, display_name, role)
    VALUES (?, ?, ?, ?, ?)`
-).run(cleanerId, 'cleaner@bradly.demo', passwordHash, 'Demo Cleaner', 'cleaner');
+).run(cleanerId, 'cleaner@bradley.demo', passwordHash, 'Demo Cleaner', 'cleaner');
 
-const owner = db.prepare('SELECT id FROM users WHERE email = ?').get('owner@bradly.demo');
-const cleaner = db.prepare('SELECT id FROM users WHERE email = ?').get('cleaner@bradly.demo');
+const owner = db.prepare('SELECT id FROM users WHERE email = ?').get('owner@bradley.demo');
+const cleaner = db.prepare('SELECT id FROM users WHERE email = ?').get('cleaner@bradley.demo');
 
 if (owner && cleaner) {
   const existingHome = db.prepare('SELECT id FROM homes WHERE owner_id = ?').get(owner.id);
@@ -65,8 +65,8 @@ if (owner && cleaner) {
   ).run(cleaner.id, '@demo-cleaner', '555-0100', '$democleaner', 'demo-cleaner@paypal.com');
 
   console.log('Seeded demo accounts:');
-  console.log('  owner@bradly.demo / demo1234');
-  console.log('  cleaner@bradly.demo / demo1234');
+  console.log('  owner@bradley.demo / demo1234');
+  console.log('  cleaner@bradley.demo / demo1234');
 } else {
   console.log('Demo users already exist or could not be created.');
 }

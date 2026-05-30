@@ -8,7 +8,7 @@ import db from './db.js';
 
 const app = express();
 const PORT = Number(process.env.PORT || 3847);
-const JWT_SECRET = process.env.JWT_SECRET || 'bradly-dev-secret-change-in-production';
+const JWT_SECRET = process.env.JWT_SECRET || 'bradley-dev-secret-change-in-production';
 const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
 
 app.use(cors());
@@ -38,7 +38,7 @@ async function sendExpoPush(tokens, { title, body, data }) {
     body,
     data: data || {},
     priority: 'high',
-    channelId: 'bradly-alerts',
+    channelId: 'bradley-alerts',
   }));
 
   try {
@@ -921,7 +921,7 @@ app.patch('/invoices/:id/cancel', auth, (req, res) => {
 });
 
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, service: 'bradly-api' });
+  res.json({ ok: true, service: 'bradley-api' });
 });
 
 function getLanIp() {
@@ -938,6 +938,6 @@ function getLanIp() {
 
 app.listen(PORT, '0.0.0.0', () => {
   const ip = getLanIp();
-  console.log(`Bradly API running on http://${ip}:${PORT}`);
+  console.log(`Bradley API running on http://${ip}:${PORT}`);
   console.log(`Local: http://127.0.0.1:${PORT}`);
 });

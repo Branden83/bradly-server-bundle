@@ -1,0 +1,18 @@
+[Unit]
+Description=Bradley API Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/bradley/server
+Environment=NODE_ENV=production
+Environment=PORT=3847
+Environment=JWT_SECRET=CHANGE_ME_ON_DEPLOY
+Environment=BRADLEY_DB_PATH=/opt/bradley/data/bradley.db
+ExecStart=/usr/bin/node index.js
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
