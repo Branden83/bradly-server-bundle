@@ -35,7 +35,12 @@ function enrichProposal(row, request) {
     .prepare('SELECT * FROM cleaner_profiles WHERE id = ?')
     .get(row.cleaner_profile_id);
   const cleaner = db.prepare('SELECT display_name FROM users WHERE id = ?').get(row.cleaner_id);
-  const matchScore = scoreProposalForHomeowner(row, request, profile);
+  const serviceAreas = profile
+    ? db
+        .prepare('SELECT * FROM cleaner_service_areas WHERE cleaner_profile_id = ?')
+        .all(profile.id)
+    : [];
+  const match = scoreProposalForHomeowner(row, request, profile, serviceAreas);
   let agreementId = null;
   if (row.status === 'accepted') {
     const agreement = db
@@ -45,7 +50,10 @@ function enrichProposal(row, request) {
   }
   return formatProposalRow(row, {
     cleanerName: profile?.display_name || cleaner?.display_name,
-    matchScore,
+    matchScore: match.score,
+    distanceMiles: match.distance_miles,
+    distanceLabel: match.distance_label,
+    matchReasons: match.reasons,
     agreementId,
   });
 }

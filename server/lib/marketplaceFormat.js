@@ -80,32 +80,121 @@ export function formatRequestTaskRow(task) {
   };
 }
 
-export function formatCleanerProfileRow(row, { serviceAreas = [], availability = [] } = {}) {
+export function formatCleanerLanguageRow(row) {
   if (!row) return null;
   return {
     id: row.id,
-    user_id: row.user_id,
-    display_name: row.display_name,
-    bio: row.bio || '',
-    experience_years: row.experience_years ?? 0,
-    hourly_rate_cents: row.hourly_rate_cents,
-    minimum_visit_minutes: row.minimum_visit_minutes,
-    minimum_visit_cents: row.minimum_visit_cents,
-    accepts_new_clients: !!row.accepts_new_clients,
-    supplies_included: !!row.supplies_included,
-    brings_vacuum: !!row.brings_vacuum,
-    languages: row.languages || '',
-    profile_status: row.profile_status,
-    background_check_status: row.background_check_status,
-    insurance_status: row.insurance_status,
+    language_code: row.language_code,
+    language_name: row.language_name,
+    proficiency: row.proficiency,
     created_at: row.created_at,
     updated_at: row.updated_at,
-    service_areas: serviceAreas,
-    availability,
   };
 }
 
-export function formatProposalRow(row, { cleanerName, matchScore, agreementId } = {}) {
+export function formatCleanerServiceRow(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    service_key: row.service_key,
+    service_label: row.service_label,
+    is_offered: !!row.is_offered,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+}
+
+export function formatCleanerServiceAreaRow(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    zip_code: row.zip_code,
+    city: row.city,
+    state: row.state,
+    radius_miles: row.radius_miles ?? null,
+    is_primary: !!row.is_primary,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+}
+
+export function formatCleanerAvailabilityRow(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    day_of_week: row.day_of_week,
+    start_time: row.start_time,
+    end_time: row.end_time,
+    is_available: !!row.is_available,
+    notes: row.notes || '',
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+}
+
+export function formatCleanerProfileRow(
+  row,
+  {
+    serviceAreas = [],
+    availability = [],
+    languages = [],
+    services = [],
+    includeAdminNotes = true,
+  } = {}
+) {
+  if (!row) return null;
+  const profile = {
+    id: row.id,
+    user_id: row.user_id,
+    display_name: row.display_name,
+    profile_photo_url: row.profile_photo_url ?? null,
+    bio: row.bio || '',
+    experience_years: row.experience_years ?? null,
+    hourly_rate_cents: row.hourly_rate_cents ?? null,
+    minimum_visit_minutes: row.minimum_visit_minutes ?? null,
+    minimum_visit_cents: row.minimum_visit_cents ?? null,
+    accepts_new_clients: !!row.accepts_new_clients,
+    supplies_included: !!row.supplies_included,
+    brings_vacuum: !!row.brings_vacuum,
+    pet_comfort_level: row.pet_comfort_level ?? 'none',
+    fragrance_free_available: !!row.fragrance_free_available,
+    eco_friendly_products_available: !!row.eco_friendly_products_available,
+    bleach_allowed: row.bleach_allowed !== 0,
+    deep_cleaning_available: !!row.deep_cleaning_available,
+    move_in_move_out_available: !!row.move_in_move_out_available,
+    recurring_cleaning_available: row.recurring_cleaning_available !== 0,
+    one_time_cleaning_available: row.one_time_cleaning_available !== 0,
+    profile_status: row.profile_status,
+    background_check_status: row.background_check_status,
+    insurance_status: row.insurance_status,
+    stripe_onboarding_status: row.stripe_onboarding_status ?? 'not_started',
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+    languages: languages.map(formatCleanerLanguageRow),
+    services: services.map(formatCleanerServiceRow),
+    service_areas: serviceAreas.map(formatCleanerServiceAreaRow),
+    availability: availability.map(formatCleanerAvailabilityRow),
+  };
+
+  if (includeAdminNotes) {
+    profile.admin_notes = row.admin_notes || '';
+  }
+
+  return profile;
+}
+
+/** Public / match-safe view — omits admin_notes and internal moderation fields. */
+export function formatCleanerProfilePublicRow(row, extras = {}) {
+  const profile = formatCleanerProfileRow(row, { ...extras, includeAdminNotes: false });
+  if (!profile) return null;
+  delete profile.admin_notes;
+  return profile;
+}
+
+export function formatProposalRow(
+  row,
+  { cleanerName, matchScore, distanceMiles, distanceLabel, matchReasons, agreementId } = {}
+) {
   if (!row) return null;
   const minutes =
     row.recurring_estimated_minutes ?? row.first_visit_estimated_minutes ?? 0;
@@ -128,6 +217,9 @@ export function formatProposalRow(row, { cleanerName, matchScore, agreementId } 
     estimated_minutes: minutes,
     estimated_cost_cents: cost,
     match_score: matchScore ?? 0,
+    distance_miles: distanceMiles ?? null,
+    distance_label: distanceLabel ?? null,
+    match_reasons: matchReasons ?? [],
     supplies_included: !!row.supplies_included,
     proposed_day: row.proposed_day,
     proposed_start_time: row.proposed_start_time,

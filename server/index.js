@@ -6,6 +6,7 @@ import { networkInterfaces } from 'os';
 import { v4 as uuid } from 'uuid';
 import { getCleanerReminders } from './ai/reminders.js';
 import db from './db.js';
+import { registerCleanerProfileRoutes } from './routes/cleanerProfile.js';
 import { registerMarketplaceRoutes } from './routes/marketplace.js';
 import {
   buildInvoiceFeeBreakdown,
@@ -1660,6 +1661,7 @@ app.put('/admin/settings', authRequired, requireAdmin, (req, res) => {
   res.json({ settings });
 });
 
+registerCleanerProfileRoutes(app, { auth, authRequired, requireAdmin });
 registerMarketplaceRoutes(app, { auth, authRequired, requireAdmin });
 
 app.get('/health', (_req, res) => {

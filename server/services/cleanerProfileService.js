@@ -1,58 +1,80 @@
 import { v4 as uuid } from 'uuid';
 import db from '../db.js';
 import { assertFound, ServiceError } from '../lib/serviceError.js';
-import { formatCleanerProfileRow } from '../lib/marketplaceFormat.js';
 import {
-  requireBoolean,
-  requireNonNegativeInt,
-  requirePositiveInt,
-  requireState,
-  requireString,
-  requireZip,
-  requireDayOfWeek,
-  requireTime,
-  validateProfileStatus,
-} from '../validation/marketplace.js';
+  formatCleanerProfilePublicRow,
+  formatCleanerProfileRow,
+} from '../lib/marketplaceFormat.js';
+import { validateProfileInput, validateProfileStatus } from '../validation/cleanerProfile.js';
+import {
+  assertCleanerUser,
+  assertProfileEditable,
+  getProfileRowByUserId,
+  requireProfileRowByUserId,
+} from './cleanerProfileHelpers.js';
+import { listAvailabilityForProfileId } from './cleanerAvailabilityService.js';
+import { listLanguagesForProfileId } from './cleanerLanguageService.js';
+import { listServicesForProfileId } from './cleanerServicesService.js';
+import { listServiceAreasForProfileId } from './cleanerServiceAreaService.js';
+import { assertReadyForReview, getProfileCompletion } from './profileCompletionService.js';
+
+// Re-export sub-services for backward compatibility with existing routes.
+export {
+  addServiceArea,
+  listServiceAreas,
+  removeServiceArea,
+  updateServiceArea,
+} from './cleanerServiceAreaService.js';
+export {
+  addAvailability,
+  deleteAvailability,
+  listAvailability,
+  updateAvailability,
+} from './cleanerAvailabilityService.js';
 
 function loadProfileExtras(profileId) {
-  const serviceAreas = db
-    .prepare('SELECT * FROM cleaner_service_areas WHERE cleaner_profile_id = ? ORDER BY zip_code')
-    .all(profileId);
-  const availability = db
-    .prepare(
-      `SELECT * FROM cleaner_availability WHERE cleaner_profile_id = ? ORDER BY day_of_week, start_time`
-    )
-    .all(profileId);
-  return { serviceAreas, availability };
+  return {
+    serviceAreas: listServiceAreasForProfileId(profileId),
+    availability: listAvailabilityForProfileId(profileId),
+    languages: listLanguagesForProfileId(profileId),
+    services: listServicesForProfileId(profileId),
+  };
 }
 
-function assertCleanerUser(userId) {
-  const user = db.prepare('SELECT id, role FROM users WHERE id = ?').get(userId);
-  assertFound(user, 'User not found');
-  if (user.role !== 'cleaner') {
-    throw new ServiceError('Only cleaners can manage a marketplace profile', { status: 403 });
-  }
-  return user;
+function formatFullProfile(row, { includeAdminNotes = true } = {}) {
+  const extras = loadProfileExtras(row.id);
+  return formatCleanerProfileRow(row, { ...extras, includeAdminNotes });
 }
 
 /**
  * @param {string} userId
+ * @param {{ includeAdminNotes?: boolean }} [options]
  */
-export function getProfileByUserId(userId) {
-  const row = db.prepare('SELECT * FROM cleaner_profiles WHERE user_id = ?').get(userId);
+export function getProfileByUserId(userId, { includeAdminNotes = true } = {}) {
+  const row = getProfileRowByUserId(userId);
   if (!row) return null;
-  const extras = loadProfileExtras(row.id);
-  return formatCleanerProfileRow(row, extras);
+  return formatFullProfile(row, { includeAdminNotes });
 }
 
 /**
  * @param {string} profileId
+ * @param {{ includeAdminNotes?: boolean }} [options]
  */
-export function getProfileById(profileId) {
+export function getProfileById(profileId, { includeAdminNotes = true } = {}) {
+  const row = db.prepare('SELECT * FROM cleaner_profiles WHERE id = ?').get(profileId);
+  if (!row) return null;
+  return formatFullProfile(row, { includeAdminNotes });
+}
+
+/**
+ * Public / match-safe profile — no admin_notes.
+ * @param {string} profileId
+ */
+export function getPublicProfileById(profileId) {
   const row = db.prepare('SELECT * FROM cleaner_profiles WHERE id = ?').get(profileId);
   if (!row) return null;
   const extras = loadProfileExtras(row.id);
-  return formatCleanerProfileRow(row, extras);
+  return formatCleanerProfilePublicRow(row, extras);
 }
 
 /**
@@ -62,61 +84,53 @@ export function getProfileById(profileId) {
 export function createProfile(userId, body) {
   assertCleanerUser(userId);
 
-  const existing = db.prepare('SELECT id FROM cleaner_profiles WHERE user_id = ?').get(userId);
+  const existing = getProfileRowByUserId(userId);
   if (existing) {
     throw new ServiceError('Profile already exists. Use update instead.', { status: 409 });
   }
 
   const user = db.prepare('SELECT display_name FROM users WHERE id = ?').get(userId);
-  const displayName = requireString(body.displayName ?? body.display_name ?? user?.display_name, 'display name', {
-    max: 120,
-  });
-  const bio = body.bio != null ? String(body.bio).trim().slice(0, 2000) : '';
-  const experienceYears = requireNonNegativeInt(
-    body.experienceYears ?? body.experience_years ?? 0,
-    'experience years',
-    { max: 60 }
+  const input = validateProfileInput(
+    {
+      ...body,
+      displayName: body.displayName ?? body.display_name ?? user?.display_name,
+      acceptsNewClients: body.acceptsNewClients ?? body.accepts_new_clients ?? false,
+    },
+    { forCreate: true }
   );
-  const hourlyRateCents = requirePositiveInt(
-    body.hourlyRateCents ?? body.hourly_rate_cents,
-    'hourly rate',
-    { min: 100, max: 50000 }
-  );
-  const minimumVisitMinutes = requirePositiveInt(
-    body.minimumVisitMinutes ?? body.minimum_visit_minutes ?? 60,
-    'minimum visit minutes',
-    { min: 15, max: 480 }
-  );
-  const minimumVisitCents = requireNonNegativeInt(
-    body.minimumVisitCents ?? body.minimum_visit_cents ?? 0,
-    'minimum visit charge'
-  );
-  const acceptsNewClients = body.acceptsNewClients ?? body.accepts_new_clients ?? true;
-  const suppliesIncluded = body.suppliesIncluded ?? body.supplies_included ?? false;
-  const bringsVacuum = body.bringsVacuum ?? body.brings_vacuum ?? false;
-  const languages = body.languages != null ? String(body.languages).trim().slice(0, 500) : '';
 
   const id = uuid();
   db.prepare(
     `INSERT INTO cleaner_profiles (
-      id, user_id, display_name, bio, experience_years,
+      id, user_id, display_name, profile_photo_url, bio, experience_years,
       hourly_rate_cents, minimum_visit_minutes, minimum_visit_cents,
-      accepts_new_clients, supplies_included, brings_vacuum, languages,
-      profile_status, background_check_status, insurance_status
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', 'not_provided', 'not_provided')`
+      accepts_new_clients, supplies_included, brings_vacuum,
+      pet_comfort_level, fragrance_free_available, eco_friendly_products_available,
+      bleach_allowed, deep_cleaning_available, move_in_move_out_available,
+      recurring_cleaning_available, one_time_cleaning_available,
+      profile_status, background_check_status, insurance_status, stripe_onboarding_status
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', 'not_provided', 'not_provided', 'not_started')`
   ).run(
     id,
     userId,
-    displayName,
-    bio,
-    experienceYears,
-    hourlyRateCents,
-    minimumVisitMinutes,
-    minimumVisitCents,
-    acceptsNewClients ? 1 : 0,
-    suppliesIncluded ? 1 : 0,
-    bringsVacuum ? 1 : 0,
-    languages
+    input.display_name,
+    input.profile_photo_url ?? null,
+    input.bio ?? '',
+    input.experience_years ?? null,
+    input.hourly_rate_cents ?? null,
+    input.minimum_visit_minutes ?? null,
+    input.minimum_visit_cents ?? null,
+    input.accepts_new_clients ?? 0,
+    input.supplies_included ?? 0,
+    input.brings_vacuum ?? 0,
+    input.pet_comfort_level ?? 'none',
+    input.fragrance_free_available ?? 0,
+    input.eco_friendly_products_available ?? 0,
+    input.bleach_allowed ?? 1,
+    input.deep_cleaning_available ?? 0,
+    input.move_in_move_out_available ?? 0,
+    input.recurring_cleaning_available ?? 1,
+    input.one_time_cleaning_available ?? 1
   );
 
   return getProfileById(id);
@@ -128,82 +142,28 @@ export function createProfile(userId, body) {
  */
 export function updateProfile(userId, body) {
   assertCleanerUser(userId);
-  const row = db.prepare('SELECT * FROM cleaner_profiles WHERE user_id = ?').get(userId);
-  assertFound(row, 'Profile not found. Create a profile first.');
+  const row = requireProfileRowByUserId(userId);
+  assertProfileEditable(row, { adminOverride: body._adminOverride });
 
-  if (['suspended', 'rejected'].includes(row.profile_status) && !body._adminOverride) {
-    throw new ServiceError('Profile cannot be edited in its current status', { status: 403 });
-  }
-
+  const input = validateProfileInput(body);
   const patch = [];
-  const patchValues = [];
-  if (body.displayName != null || body.display_name != null) {
-    patch.push('display_name = ?');
-    patchValues.push(requireString(body.displayName ?? body.display_name, 'display name', { max: 120 }));
-  }
-  if (body.bio != null) {
-    patch.push('bio = ?');
-    patchValues.push(String(body.bio).trim().slice(0, 2000));
-  }
-  if (body.experienceYears != null || body.experience_years != null) {
-    patch.push('experience_years = ?');
-    patchValues.push(
-      requireNonNegativeInt(body.experienceYears ?? body.experience_years, 'experience years', { max: 60 })
-    );
-  }
-  if (body.hourlyRateCents != null || body.hourly_rate_cents != null) {
-    patch.push('hourly_rate_cents = ?');
-    patchValues.push(
-      requirePositiveInt(body.hourlyRateCents ?? body.hourly_rate_cents, 'hourly rate', {
-        min: 100,
-        max: 50000,
-      })
-    );
-  }
-  if (body.minimumVisitMinutes != null || body.minimum_visit_minutes != null) {
-    patch.push('minimum_visit_minutes = ?');
-    patchValues.push(
-      requirePositiveInt(body.minimumVisitMinutes ?? body.minimum_visit_minutes, 'minimum visit minutes', {
-        min: 15,
-        max: 480,
-      })
-    );
-  }
-  if (body.minimumVisitCents != null || body.minimum_visit_cents != null) {
-    patch.push('minimum_visit_cents = ?');
-    patchValues.push(
-      requireNonNegativeInt(body.minimumVisitCents ?? body.minimum_visit_cents, 'minimum visit charge')
-    );
-  }
-  if (body.acceptsNewClients != null || body.accepts_new_clients != null) {
-    patch.push('accepts_new_clients = ?');
-    patchValues.push(body.acceptsNewClients ?? body.accepts_new_clients ? 1 : 0);
-  }
-  if (body.suppliesIncluded != null || body.supplies_included != null) {
-    patch.push('supplies_included = ?');
-    patchValues.push(body.suppliesIncluded ?? body.supplies_included ? 1 : 0);
-  }
-  if (body.bringsVacuum != null || body.brings_vacuum != null) {
-    patch.push('brings_vacuum = ?');
-    patchValues.push(body.bringsVacuum ?? body.brings_vacuum ? 1 : 0);
-  }
-  if (body.languages != null) {
-    patch.push('languages = ?');
-    patchValues.push(String(body.languages).trim().slice(0, 500));
+  const values = [];
+
+  for (const [column, value] of Object.entries(input)) {
+    patch.push(`${column} = ?`);
+    values.push(value);
   }
 
   if (patch.length) {
     patch.push("updated_at = datetime('now')");
     db.prepare(`UPDATE cleaner_profiles SET ${patch.join(', ')} WHERE id = ?`).run(
-      ...patchValues,
+      ...values,
       row.id
     );
   }
 
   if (body.submitForReview) {
-    db.prepare(
-      `UPDATE cleaner_profiles SET profile_status = 'pending_review', updated_at = datetime('now') WHERE id = ?`
-    ).run(row.id);
+    return submitForReview(userId);
   }
 
   return getProfileById(row.id);
@@ -211,130 +171,28 @@ export function updateProfile(userId, body) {
 
 /**
  * @param {string} userId
- * @param {{ zipCode?: string, zip_code?: string, city: string, state: string, radiusMiles?: number }} body
  */
-export function addServiceArea(userId, body) {
+export function submitForReview(userId) {
   assertCleanerUser(userId);
-  const profile = db.prepare('SELECT * FROM cleaner_profiles WHERE user_id = ?').get(userId);
-  assertFound(profile, 'Create a profile before adding service areas');
+  const row = requireProfileRowByUserId(userId);
+  assertProfileEditable(row);
 
-  const zipCode = requireZip(body.zipCode ?? body.zip_code);
-  const city = requireString(body.city, 'city', { max: 120 });
-  const state = requireState(body.state);
-  const radiusMiles =
-    body.radiusMiles != null || body.radius_miles != null
-      ? requirePositiveInt(body.radiusMiles ?? body.radius_miles, 'radius miles', { min: 1, max: 100 })
-      : null;
-
-  const dup = db
-    .prepare(
-      'SELECT id FROM cleaner_service_areas WHERE cleaner_profile_id = ? AND zip_code = ?'
-    )
-    .get(profile.id, zipCode);
-  if (dup) {
-    throw new ServiceError('This ZIP is already in your service area', { status: 409 });
+  if (row.profile_status === 'pending_review') {
+    throw new ServiceError('Profile is already pending review', { status: 409 });
+  }
+  if (row.profile_status === 'approved') {
+    throw new ServiceError('Approved profiles cannot be resubmitted for review', { status: 409 });
   }
 
-  const id = uuid();
+  assertReadyForReview(userId);
+
   db.prepare(
-    `INSERT INTO cleaner_service_areas (id, cleaner_profile_id, zip_code, city, state, radius_miles)
-     VALUES (?, ?, ?, ?, ?, ?)`
-  ).run(id, profile.id, zipCode, city, state, radiusMiles);
+    `UPDATE cleaner_profiles
+     SET profile_status = 'pending_review', updated_at = datetime('now')
+     WHERE id = ?`
+  ).run(row.id);
 
-  return db.prepare('SELECT * FROM cleaner_service_areas WHERE id = ?').get(id);
-}
-
-/**
- * @param {string} userId
- * @param {string} areaId
- */
-export function removeServiceArea(userId, areaId) {
-  assertCleanerUser(userId);
-  const profile = db.prepare('SELECT id FROM cleaner_profiles WHERE user_id = ?').get(userId);
-  assertFound(profile, 'Profile not found');
-
-  const area = db
-    .prepare('SELECT * FROM cleaner_service_areas WHERE id = ? AND cleaner_profile_id = ?')
-    .get(areaId, profile.id);
-  assertFound(area, 'Service area not found');
-
-  db.prepare('DELETE FROM cleaner_service_areas WHERE id = ?').run(areaId);
-  return { ok: true };
-}
-
-/**
- * @param {string} userId
- * @param {object} body
- */
-export function addAvailability(userId, body) {
-  assertCleanerUser(userId);
-  const profile = db.prepare('SELECT * FROM cleaner_profiles WHERE user_id = ?').get(userId);
-  assertFound(profile, 'Create a profile before setting availability');
-
-  const dayOfWeek = requireDayOfWeek(body.dayOfWeek ?? body.day_of_week);
-  const startTime = requireTime(body.startTime ?? body.start_time, 'start time');
-  const endTime = requireTime(body.endTime ?? body.end_time, 'end time');
-  const isAvailable = body.isAvailable ?? body.is_available ?? true;
-
-  if (startTime >= endTime) {
-    throw new ServiceError('End time must be after start time');
-  }
-
-  const id = uuid();
-  db.prepare(
-    `INSERT INTO cleaner_availability (
-      id, cleaner_profile_id, day_of_week, start_time, end_time, is_available
-    ) VALUES (?, ?, ?, ?, ?, ?)`
-  ).run(id, profile.id, dayOfWeek, startTime, endTime, isAvailable ? 1 : 0);
-
-  return db.prepare('SELECT * FROM cleaner_availability WHERE id = ?').get(id);
-}
-
-/**
- * @param {string} userId
- * @param {string} slotId
- * @param {object} body
- */
-export function updateAvailability(userId, slotId, body) {
-  assertCleanerUser(userId);
-  const profile = db.prepare('SELECT id FROM cleaner_profiles WHERE user_id = ?').get(userId);
-  assertFound(profile, 'Profile not found');
-
-  const slot = db
-    .prepare('SELECT * FROM cleaner_availability WHERE id = ? AND cleaner_profile_id = ?')
-    .get(slotId, profile.id);
-  assertFound(slot, 'Availability slot not found');
-
-  const patch = [];
-  const values = [];
-  if (body.dayOfWeek != null || body.day_of_week != null) {
-    patch.push('day_of_week = ?');
-    values.push(requireDayOfWeek(body.dayOfWeek ?? body.day_of_week));
-  }
-  if (body.startTime != null || body.start_time != null) {
-    patch.push('start_time = ?');
-    values.push(requireTime(body.startTime ?? body.start_time, 'start time'));
-  }
-  if (body.endTime != null || body.end_time != null) {
-    patch.push('end_time = ?');
-    values.push(requireTime(body.endTime ?? body.end_time, 'end time'));
-  }
-  if (body.isAvailable != null || body.is_available != null) {
-    patch.push('is_available = ?');
-    values.push(body.isAvailable ?? body.is_available ? 1 : 0);
-  }
-
-  if (!patch.length) {
-    throw new ServiceError('No fields to update');
-  }
-
-  patch.push("updated_at = datetime('now')");
-  db.prepare(`UPDATE cleaner_availability SET ${patch.join(', ')} WHERE id = ?`).run(
-    ...values,
-    slotId
-  );
-
-  return db.prepare('SELECT * FROM cleaner_availability WHERE id = ?').get(slotId);
+  return getProfileById(row.id);
 }
 
 /**
@@ -357,29 +215,27 @@ export function updateProfileStatus(profileId, status, adminNotes) {
 }
 
 /**
- * @param {{ status?: string, limit?: number }} [filters]
+ * Admin: update admin_notes only.
+ * @param {string} profileId
+ * @param {string} adminNotes
  */
-export function listServiceAreas(userId) {
-  const profile = db.prepare('SELECT id FROM cleaner_profiles WHERE user_id = ?').get(userId);
-  if (!profile) return [];
-  return db
-    .prepare('SELECT * FROM cleaner_service_areas WHERE cleaner_profile_id = ? ORDER BY zip_code')
-    .all(profile.id);
+export function updateAdminNotes(profileId, adminNotes) {
+  const row = db.prepare('SELECT * FROM cleaner_profiles WHERE id = ?').get(profileId);
+  assertFound(row, 'Profile not found');
+
+  const notes =
+    adminNotes != null ? String(adminNotes).trim().slice(0, 5000) : '';
+
+  db.prepare(
+    `UPDATE cleaner_profiles SET admin_notes = ?, updated_at = datetime('now') WHERE id = ?`
+  ).run(notes, profileId);
+
+  return getProfileById(profileId);
 }
 
 /**
- * @param {string} userId
+ * @param {{ status?: string, limit?: number }} [filters]
  */
-export function listAvailability(userId) {
-  const profile = db.prepare('SELECT id FROM cleaner_profiles WHERE user_id = ?').get(userId);
-  if (!profile) return [];
-  return db
-    .prepare(
-      `SELECT * FROM cleaner_availability WHERE cleaner_profile_id = ? ORDER BY day_of_week, start_time`
-    )
-    .all(profile.id);
-}
-
 export function listProfilesForAdmin(filters = {}) {
   const limit = Math.min(filters.limit ?? 100, 200);
   if (filters.status) {
@@ -400,4 +256,12 @@ export function listProfilesForAdmin(filters = {}) {
        ORDER BY cp.updated_at DESC LIMIT ?`
     )
     .all(limit);
+}
+
+/**
+ * @param {string} userId
+ */
+export function getProfileCompletionSummary(userId) {
+  assertCleanerUser(userId);
+  return getProfileCompletion(userId);
 }

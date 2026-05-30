@@ -1,10 +1,8 @@
 import { ServiceError } from '../lib/serviceError.js';
-import * as cleanerProfileService from '../services/cleanerProfileService.js';
 import * as cleaningRequestService from '../services/cleaningRequestService.js';
 import * as proposalService from '../services/proposalService.js';
 import * as agreementService from '../services/agreementService.js';
 import * as matchingService from '../services/matchingService.js';
-import { formatCleanerProfileRow } from '../lib/marketplaceFormat.js';
 
 function handleServiceError(err, res) {
   if (err instanceof ServiceError) {
@@ -180,97 +178,6 @@ export function registerMarketplaceRoutes(app, { auth, authRequired, requireAdmi
     })
   );
 
-  // ─── Cleaner: profile ─────────────────────────────────────────────────────
-
-  app.get(
-    '/cleaner/profile',
-    auth,
-    wrap((req, res) => {
-      if (!requireCleaner(req, res)) return;
-      const profile = cleanerProfileService.getProfileByUserId(req.user.id);
-      if (!profile) return res.status(404).json({ error: 'Profile not found' });
-      res.json(profile);
-    })
-  );
-
-  app.post(
-    '/cleaner/profile',
-    auth,
-    wrap((req, res) => {
-      if (!requireCleaner(req, res)) return;
-      const profile = cleanerProfileService.createProfile(req.user.id, req.body);
-      res.status(201).json(profile);
-    })
-  );
-
-  app.patch(
-    '/cleaner/profile',
-    auth,
-    wrap((req, res) => {
-      if (!requireCleaner(req, res)) return;
-      const profile = cleanerProfileService.updateProfile(req.user.id, req.body);
-      res.json(profile);
-    })
-  );
-
-  app.post(
-    '/cleaner/service-areas',
-    auth,
-    wrap((req, res) => {
-      if (!requireCleaner(req, res)) return;
-      const area = cleanerProfileService.addServiceArea(req.user.id, req.body);
-      res.status(201).json(area);
-    })
-  );
-
-  app.delete(
-    '/cleaner/service-areas/:id',
-    auth,
-    wrap((req, res) => {
-      if (!requireCleaner(req, res)) return;
-      const result = cleanerProfileService.removeServiceArea(req.user.id, req.params.id);
-      res.json(result);
-    })
-  );
-
-  app.get(
-    '/cleaner/service-areas',
-    auth,
-    wrap((req, res) => {
-      if (!requireCleaner(req, res)) return;
-      res.json({ areas: cleanerProfileService.listServiceAreas(req.user.id) });
-    })
-  );
-
-  app.post(
-    '/cleaner/availability',
-    auth,
-    wrap((req, res) => {
-      if (!requireCleaner(req, res)) return;
-      const slot = cleanerProfileService.addAvailability(req.user.id, req.body);
-      res.status(201).json(slot);
-    })
-  );
-
-  app.patch(
-    '/cleaner/availability/:id',
-    auth,
-    wrap((req, res) => {
-      if (!requireCleaner(req, res)) return;
-      const slot = cleanerProfileService.updateAvailability(req.user.id, req.params.id, req.body);
-      res.json(slot);
-    })
-  );
-
-  app.get(
-    '/cleaner/availability',
-    auth,
-    wrap((req, res) => {
-      if (!requireCleaner(req, res)) return;
-      res.json({ slots: cleanerProfileService.listAvailability(req.user.id) });
-    })
-  );
-
   app.get(
     '/cleaner/available-requests',
     auth,
@@ -359,46 +266,6 @@ export function registerMarketplaceRoutes(app, { auth, authRequired, requireAdmi
     wrap((req, res) => {
       const request = cleaningRequestService.getRequestForAdmin(req.params.id);
       res.json({ request });
-    })
-  );
-
-  app.get(
-    '/admin/cleaner-profiles',
-    authRequired,
-    requireAdmin,
-    wrap((req, res) => {
-      const rows = cleanerProfileService.listProfilesForAdmin({
-        status: req.query.status,
-        limit: req.query.limit ? Number(req.query.limit) : undefined,
-      });
-      res.json({
-        profiles: rows.map((row) => formatCleanerProfileRow(row, { serviceAreas: [], availability: [] })),
-      });
-    })
-  );
-
-  app.get(
-    '/admin/cleaner-profiles/:id',
-    authRequired,
-    requireAdmin,
-    wrap((req, res) => {
-      const profile = cleanerProfileService.getProfileById(req.params.id);
-      if (!profile) return res.status(404).json({ error: 'Profile not found' });
-      res.json({ profile });
-    })
-  );
-
-  app.patch(
-    '/admin/cleaner-profiles/:id/status',
-    authRequired,
-    requireAdmin,
-    wrap((req, res) => {
-      const profile = cleanerProfileService.updateProfileStatus(
-        req.params.id,
-        req.body.profileStatus ?? req.body.profile_status ?? req.body.status,
-        req.body.adminNotes ?? req.body.admin_notes
-      );
-      res.json({ profile });
     })
   );
 

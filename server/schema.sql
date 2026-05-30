@@ -146,6 +146,7 @@ CREATE TABLE IF NOT EXISTS cleaner_profiles (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
   display_name TEXT NOT NULL,
+  profile_photo_url TEXT,
   bio TEXT NOT NULL DEFAULT '',
   experience_years INTEGER,
   hourly_rate_cents INTEGER,
@@ -155,6 +156,16 @@ CREATE TABLE IF NOT EXISTS cleaner_profiles (
   supplies_included INTEGER NOT NULL DEFAULT 0,
   brings_vacuum INTEGER NOT NULL DEFAULT 0,
   languages TEXT NOT NULL DEFAULT '[]',
+  pet_comfort_level TEXT NOT NULL DEFAULT 'none' CHECK (
+    pet_comfort_level IN ('none', 'cats', 'dogs', 'cats_and_dogs', 'all_pets')
+  ),
+  fragrance_free_available INTEGER NOT NULL DEFAULT 0,
+  eco_friendly_products_available INTEGER NOT NULL DEFAULT 0,
+  bleach_allowed INTEGER NOT NULL DEFAULT 1,
+  deep_cleaning_available INTEGER NOT NULL DEFAULT 0,
+  move_in_move_out_available INTEGER NOT NULL DEFAULT 0,
+  recurring_cleaning_available INTEGER NOT NULL DEFAULT 1,
+  one_time_cleaning_available INTEGER NOT NULL DEFAULT 1,
   profile_status TEXT NOT NULL DEFAULT 'draft' CHECK (
     profile_status IN ('draft', 'pending_review', 'approved', 'rejected', 'suspended')
   ),
@@ -164,9 +175,36 @@ CREATE TABLE IF NOT EXISTS cleaner_profiles (
   insurance_status TEXT NOT NULL DEFAULT 'not_provided' CHECK (
     insurance_status IN ('not_provided', 'pending', 'verified', 'expired')
   ),
+  stripe_onboarding_status TEXT NOT NULL DEFAULT 'not_started' CHECK (
+    stripe_onboarding_status IN ('not_started', 'pending', 'complete', 'restricted')
+  ),
   admin_notes TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS cleaner_languages (
+  id TEXT PRIMARY KEY,
+  cleaner_profile_id TEXT NOT NULL REFERENCES cleaner_profiles(id) ON DELETE CASCADE,
+  language_code TEXT NOT NULL,
+  language_name TEXT NOT NULL,
+  proficiency TEXT NOT NULL DEFAULT 'conversational' CHECK (
+    proficiency IN ('basic', 'conversational', 'fluent', 'native')
+  ),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (cleaner_profile_id, language_code)
+);
+
+CREATE TABLE IF NOT EXISTS cleaner_services (
+  id TEXT PRIMARY KEY,
+  cleaner_profile_id TEXT NOT NULL REFERENCES cleaner_profiles(id) ON DELETE CASCADE,
+  service_key TEXT NOT NULL,
+  service_label TEXT NOT NULL,
+  is_offered INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (cleaner_profile_id, service_key)
 );
 
 CREATE TABLE IF NOT EXISTS cleaner_service_areas (
@@ -176,7 +214,9 @@ CREATE TABLE IF NOT EXISTS cleaner_service_areas (
   city TEXT NOT NULL,
   state TEXT NOT NULL,
   radius_miles REAL,
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  is_primary INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS cleaner_availability (
@@ -186,6 +226,7 @@ CREATE TABLE IF NOT EXISTS cleaner_availability (
   start_time TEXT NOT NULL,
   end_time TEXT NOT NULL,
   is_available INTEGER NOT NULL DEFAULT 1,
+  notes TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -329,9 +370,15 @@ CREATE TABLE IF NOT EXISTS admin_match_suggestions (
 
 CREATE INDEX IF NOT EXISTS idx_cleaner_profiles_user ON cleaner_profiles(user_id);
 CREATE INDEX IF NOT EXISTS idx_cleaner_profiles_status ON cleaner_profiles(profile_status);
+CREATE INDEX IF NOT EXISTS idx_cleaner_languages_profile ON cleaner_languages(cleaner_profile_id);
+CREATE INDEX IF NOT EXISTS idx_cleaner_services_profile ON cleaner_services(cleaner_profile_id);
 CREATE INDEX IF NOT EXISTS idx_cleaner_service_areas_profile ON cleaner_service_areas(cleaner_profile_id);
 CREATE INDEX IF NOT EXISTS idx_cleaner_service_areas_zip ON cleaner_service_areas(zip_code);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cleaner_service_areas_profile_zip
+  ON cleaner_service_areas(cleaner_profile_id, zip_code);
 CREATE INDEX IF NOT EXISTS idx_cleaner_availability_profile ON cleaner_availability(cleaner_profile_id);
+CREATE INDEX IF NOT EXISTS idx_cleaner_availability_profile_day
+  ON cleaner_availability(cleaner_profile_id, day_of_week);
 CREATE INDEX IF NOT EXISTS idx_cleaning_requests_homeowner ON cleaning_requests(homeowner_id);
 CREATE INDEX IF NOT EXISTS idx_cleaning_requests_status ON cleaning_requests(status);
 CREATE INDEX IF NOT EXISTS idx_cleaning_requests_zip ON cleaning_requests(zip_code);

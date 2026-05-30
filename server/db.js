@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import Database from 'better-sqlite3';
 import { readFileSync } from 'fs';
 import { dirname, join } from 'path';
@@ -396,6 +397,150 @@ function migratePaymentMonetizationV1() {
 
 migratePaymentMonetizationV1();
 
+function migrateCleanerProfileV2() {
+  const done = db.prepare('SELECT 1 FROM _migrations WHERE name = ?').get('cleaner_profile_v2');
+  if (done) return;
+
+  const profileCols = db.prepare('PRAGMA table_info(cleaner_profiles)').all();
+  const addProfileCol = (name, ddl) => {
+    if (!profileCols.some((c) => c.name === name)) {
+      db.exec(`ALTER TABLE cleaner_profiles ADD COLUMN ${ddl}`);
+    }
+  };
+
+  addProfileCol('profile_photo_url', 'profile_photo_url TEXT');
+  addProfileCol(
+    'pet_comfort_level',
+    "pet_comfort_level TEXT NOT NULL DEFAULT 'none'"
+  );
+  addProfileCol('fragrance_free_available', 'fragrance_free_available INTEGER NOT NULL DEFAULT 0');
+  addProfileCol(
+    'eco_friendly_products_available',
+    'eco_friendly_products_available INTEGER NOT NULL DEFAULT 0'
+  );
+  addProfileCol('bleach_allowed', 'bleach_allowed INTEGER NOT NULL DEFAULT 1');
+  addProfileCol('deep_cleaning_available', 'deep_cleaning_available INTEGER NOT NULL DEFAULT 0');
+  addProfileCol('move_in_move_out_available', 'move_in_move_out_available INTEGER NOT NULL DEFAULT 0');
+  addProfileCol(
+    'recurring_cleaning_available',
+    'recurring_cleaning_available INTEGER NOT NULL DEFAULT 1'
+  );
+  addProfileCol('one_time_cleaning_available', 'one_time_cleaning_available INTEGER NOT NULL DEFAULT 1');
+  addProfileCol(
+    'stripe_onboarding_status',
+    "stripe_onboarding_status TEXT NOT NULL DEFAULT 'not_started'"
+  );
+
+  const stripeBackfill = db
+    .prepare(
+      `SELECT cp.id, u.stripe_connect_onboarding_complete, u.stripe_connect_account_id
+       FROM cleaner_profiles cp
+       JOIN users u ON u.id = cp.user_id
+       WHERE cp.stripe_onboarding_status = 'not_started'`
+    )
+    .all();
+  const stripeUpdate = db.prepare(
+    `UPDATE cleaner_profiles SET stripe_onboarding_status = ? WHERE id = ?`
+  );
+  for (const row of stripeBackfill) {
+    let status = 'not_started';
+    if (row.stripe_connect_onboarding_complete === 1) status = 'complete';
+    else if (row.stripe_connect_account_id) status = 'pending';
+    stripeUpdate.run(status, row.id);
+  }
+
+  const areaCols = db.prepare('PRAGMA table_info(cleaner_service_areas)').all();
+  if (!areaCols.some((c) => c.name === 'is_primary')) {
+    db.exec(`ALTER TABLE cleaner_service_areas ADD COLUMN is_primary INTEGER NOT NULL DEFAULT 0`);
+  }
+  if (!areaCols.some((c) => c.name === 'updated_at')) {
+    db.exec(`ALTER TABLE cleaner_service_areas ADD COLUMN updated_at TEXT`);
+    db.exec(`UPDATE cleaner_service_areas SET updated_at = datetime('now') WHERE updated_at IS NULL`);
+  }
+
+  const availCols = db.prepare('PRAGMA table_info(cleaner_availability)').all();
+  if (!availCols.some((c) => c.name === 'notes')) {
+    db.exec(`ALTER TABLE cleaner_availability ADD COLUMN notes TEXT NOT NULL DEFAULT ''`);
+  }
+
+  const sql = readFileSync(join(__dirname, 'migrations', '003_cleaner_profile_v2.sql'), 'utf8');
+  db.exec(sql);
+
+  const hasLanguagesTable = db
+    .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='cleaner_languages'")
+    .get();
+  if (hasLanguagesTable) {
+    const profiles = db
+      .prepare(`SELECT id, languages FROM cleaner_profiles WHERE languages IS NOT NULL AND languages != '' AND languages != '[]'`)
+      .all();
+    const existingLang = db.prepare(
+      'SELECT 1 FROM cleaner_languages WHERE cleaner_profile_id = ? AND language_code = ?'
+    );
+    const insertLang = db.prepare(
+      `INSERT INTO cleaner_languages (
+        id, cleaner_profile_id, language_code, language_name, proficiency
+      ) VALUES (?, ?, ?, ?, ?)`
+    );
+
+    const slugCode = (name) =>
+      name
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '_')
+        .replace(/^_|_$/g, '')
+        .slice(0, 16) || 'unknown';
+
+    for (const profile of profiles) {
+      let entries = [];
+      try {
+        const parsed = JSON.parse(profile.languages);
+        if (Array.isArray(parsed)) {
+          entries = parsed.map((item) => {
+            if (typeof item === 'string') return { name: item, proficiency: 'conversational' };
+            if (item && typeof item === 'object') {
+              return {
+                name: item.name || item.language || item.language_name || String(item),
+                code: item.code || item.language_code,
+                proficiency: item.proficiency || 'conversational',
+              };
+            }
+            return { name: String(item), proficiency: 'conversational' };
+          });
+        }
+      } catch {
+        entries = profile.languages
+          .split(',')
+          .map((s) => s.trim())
+          .filter(Boolean)
+          .map((name) => ({ name, proficiency: 'conversational' }));
+      }
+
+      for (const entry of entries) {
+        const languageName = String(entry.name || '').trim().slice(0, 120);
+        if (!languageName) continue;
+        const languageCode = (entry.code || slugCode(languageName)).slice(0, 16);
+        if (existingLang.get(profile.id, languageCode)) continue;
+        const proficiency = ['basic', 'conversational', 'fluent', 'native'].includes(
+          entry.proficiency
+        )
+          ? entry.proficiency
+          : 'conversational';
+        insertLang.run(
+          crypto.randomUUID(),
+          profile.id,
+          languageCode,
+          languageName,
+          proficiency
+        );
+      }
+    }
+  }
+
+  db.prepare(`INSERT INTO _migrations (name) VALUES (?)`).run('cleaner_profile_v2');
+}
+
+migrateCleanerProfileV2();
+
 function boolToInt(value, defaultValue = 0) {
   if (value === undefined || value === null) return defaultValue;
   return value ? 1 : 0;
@@ -430,6 +575,7 @@ export function createCleanerProfile({
   id,
   userId,
   displayName,
+  profilePhotoUrl = null,
   bio = '',
   experienceYears = null,
   hourlyRateCents = null,
@@ -439,22 +585,36 @@ export function createCleanerProfile({
   suppliesIncluded = false,
   bringsVacuum = false,
   languages = '[]',
+  petComfortLevel = 'none',
+  fragranceFreeAvailable = false,
+  ecoFriendlyProductsAvailable = false,
+  bleachAllowed = true,
+  deepCleaningAvailable = false,
+  moveInMoveOutAvailable = false,
+  recurringCleaningAvailable = true,
+  oneTimeCleaningAvailable = true,
   profileStatus = 'draft',
   backgroundCheckStatus = 'not_provided',
   insuranceStatus = 'not_provided',
+  stripeOnboardingStatus = 'not_started',
   adminNotes = '',
 }) {
   db.prepare(
     `INSERT INTO cleaner_profiles (
-      id, user_id, display_name, bio, experience_years, hourly_rate_cents,
+      id, user_id, display_name, profile_photo_url, bio, experience_years, hourly_rate_cents,
       minimum_visit_minutes, minimum_visit_cents, accepts_new_clients,
-      supplies_included, brings_vacuum, languages, profile_status,
-      background_check_status, insurance_status, admin_notes
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      supplies_included, brings_vacuum, languages, pet_comfort_level,
+      fragrance_free_available, eco_friendly_products_available, bleach_allowed,
+      deep_cleaning_available, move_in_move_out_available,
+      recurring_cleaning_available, one_time_cleaning_available,
+      profile_status, background_check_status, insurance_status,
+      stripe_onboarding_status, admin_notes
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     id,
     userId,
     displayName,
+    profilePhotoUrl,
     bio,
     experienceYears,
     hourlyRateCents,
@@ -464,9 +624,18 @@ export function createCleanerProfile({
     boolToInt(suppliesIncluded),
     boolToInt(bringsVacuum),
     jsonField(languages),
+    petComfortLevel,
+    boolToInt(fragranceFreeAvailable),
+    boolToInt(ecoFriendlyProductsAvailable),
+    boolToInt(bleachAllowed, 1),
+    boolToInt(deepCleaningAvailable),
+    boolToInt(moveInMoveOutAvailable),
+    boolToInt(recurringCleaningAvailable, 1),
+    boolToInt(oneTimeCleaningAvailable, 1),
     profileStatus,
     backgroundCheckStatus,
     insuranceStatus,
+    stripeOnboardingStatus,
     adminNotes
   );
   return getCleanerProfileById(id);
@@ -475,6 +644,7 @@ export function createCleanerProfile({
 export function updateCleanerProfile(id, fields) {
   const allowed = {
     displayName: 'display_name',
+    profilePhotoUrl: 'profile_photo_url',
     bio: 'bio',
     experienceYears: 'experience_years',
     hourlyRateCents: 'hourly_rate_cents',
@@ -484,18 +654,39 @@ export function updateCleanerProfile(id, fields) {
     suppliesIncluded: 'supplies_included',
     bringsVacuum: 'brings_vacuum',
     languages: 'languages',
+    petComfortLevel: 'pet_comfort_level',
+    fragranceFreeAvailable: 'fragrance_free_available',
+    ecoFriendlyProductsAvailable: 'eco_friendly_products_available',
+    bleachAllowed: 'bleach_allowed',
+    deepCleaningAvailable: 'deep_cleaning_available',
+    moveInMoveOutAvailable: 'move_in_move_out_available',
+    recurringCleaningAvailable: 'recurring_cleaning_available',
+    oneTimeCleaningAvailable: 'one_time_cleaning_available',
     profileStatus: 'profile_status',
     backgroundCheckStatus: 'background_check_status',
     insuranceStatus: 'insurance_status',
+    stripeOnboardingStatus: 'stripe_onboarding_status',
     adminNotes: 'admin_notes',
   };
+  const boolFields = new Set([
+    'acceptsNewClients',
+    'suppliesIncluded',
+    'bringsVacuum',
+    'fragranceFreeAvailable',
+    'ecoFriendlyProductsAvailable',
+    'bleachAllowed',
+    'deepCleaningAvailable',
+    'moveInMoveOutAvailable',
+    'recurringCleaningAvailable',
+    'oneTimeCleaningAvailable',
+  ]);
   const sets = [];
   const values = [];
   for (const [key, column] of Object.entries(allowed)) {
     if (fields[key] === undefined) continue;
     sets.push(`${column} = ?`);
-    if (['acceptsNewClients', 'suppliesIncluded', 'bringsVacuum'].includes(key)) {
-      values.push(boolToInt(fields[key]));
+    if (boolFields.has(key)) {
+      values.push(boolToInt(fields[key], key === 'bleachAllowed' ? 1 : 0));
     } else if (key === 'languages') {
       values.push(jsonField(fields[key]));
     } else {
@@ -507,6 +698,112 @@ export function updateCleanerProfile(id, fields) {
   values.push(id);
   db.prepare(`UPDATE cleaner_profiles SET ${sets.join(', ')} WHERE id = ?`).run(...values);
   return getCleanerProfileById(id);
+}
+
+export function getCleanerLanguageById(id) {
+  return db.prepare('SELECT * FROM cleaner_languages WHERE id = ?').get(id) ?? null;
+}
+
+export function listCleanerLanguagesByProfileId(cleanerProfileId) {
+  return db
+    .prepare(
+      `SELECT * FROM cleaner_languages
+       WHERE cleaner_profile_id = ?
+       ORDER BY language_name ASC`
+    )
+    .all(cleanerProfileId);
+}
+
+export function createCleanerLanguage({
+  id,
+  cleanerProfileId,
+  languageCode,
+  languageName,
+  proficiency = 'conversational',
+}) {
+  db.prepare(
+    `INSERT INTO cleaner_languages (
+      id, cleaner_profile_id, language_code, language_name, proficiency
+    ) VALUES (?, ?, ?, ?, ?)`
+  ).run(id, cleanerProfileId, languageCode, languageName, proficiency);
+  return getCleanerLanguageById(id);
+}
+
+export function updateCleanerLanguage(id, fields) {
+  const allowed = {
+    languageCode: 'language_code',
+    languageName: 'language_name',
+    proficiency: 'proficiency',
+  };
+  const sets = [];
+  const values = [];
+  for (const [key, column] of Object.entries(allowed)) {
+    if (fields[key] === undefined) continue;
+    sets.push(`${column} = ?`);
+    values.push(fields[key]);
+  }
+  if (!sets.length) return getCleanerLanguageById(id);
+  sets.push(`updated_at = datetime('now')`);
+  values.push(id);
+  db.prepare(`UPDATE cleaner_languages SET ${sets.join(', ')} WHERE id = ?`).run(...values);
+  return getCleanerLanguageById(id);
+}
+
+export function deleteCleanerLanguage(id) {
+  return db.prepare('DELETE FROM cleaner_languages WHERE id = ?').run(id);
+}
+
+export function getCleanerServiceById(id) {
+  return db.prepare('SELECT * FROM cleaner_services WHERE id = ?').get(id) ?? null;
+}
+
+export function listCleanerServicesByProfileId(cleanerProfileId) {
+  return db
+    .prepare(
+      `SELECT * FROM cleaner_services
+       WHERE cleaner_profile_id = ?
+       ORDER BY service_label ASC`
+    )
+    .all(cleanerProfileId);
+}
+
+export function createCleanerService({
+  id,
+  cleanerProfileId,
+  serviceKey,
+  serviceLabel,
+  isOffered = true,
+}) {
+  db.prepare(
+    `INSERT INTO cleaner_services (
+      id, cleaner_profile_id, service_key, service_label, is_offered
+    ) VALUES (?, ?, ?, ?, ?)`
+  ).run(id, cleanerProfileId, serviceKey, serviceLabel, boolToInt(isOffered, 1));
+  return getCleanerServiceById(id);
+}
+
+export function updateCleanerService(id, fields) {
+  const allowed = {
+    serviceKey: 'service_key',
+    serviceLabel: 'service_label',
+    isOffered: 'is_offered',
+  };
+  const sets = [];
+  const values = [];
+  for (const [key, column] of Object.entries(allowed)) {
+    if (fields[key] === undefined) continue;
+    sets.push(`${column} = ?`);
+    values.push(key === 'isOffered' ? boolToInt(fields[key], 1) : fields[key]);
+  }
+  if (!sets.length) return getCleanerServiceById(id);
+  sets.push(`updated_at = datetime('now')`);
+  values.push(id);
+  db.prepare(`UPDATE cleaner_services SET ${sets.join(', ')} WHERE id = ?`).run(...values);
+  return getCleanerServiceById(id);
+}
+
+export function deleteCleanerService(id) {
+  return db.prepare('DELETE FROM cleaner_services WHERE id = ?').run(id);
 }
 
 export function getCleanerServiceAreaById(id) {
@@ -528,11 +825,35 @@ export function createCleanerServiceArea({
   city,
   state,
   radiusMiles = null,
+  isPrimary = false,
 }) {
   db.prepare(
-    `INSERT INTO cleaner_service_areas (id, cleaner_profile_id, zip_code, city, state, radius_miles)
-     VALUES (?, ?, ?, ?, ?, ?)`
-  ).run(id, cleanerProfileId, zipCode, city, state, radiusMiles);
+    `INSERT INTO cleaner_service_areas (
+      id, cleaner_profile_id, zip_code, city, state, radius_miles, is_primary
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)`
+  ).run(id, cleanerProfileId, zipCode, city, state, radiusMiles, boolToInt(isPrimary));
+  return getCleanerServiceAreaById(id);
+}
+
+export function updateCleanerServiceArea(id, fields) {
+  const allowed = {
+    zipCode: 'zip_code',
+    city: 'city',
+    state: 'state',
+    radiusMiles: 'radius_miles',
+    isPrimary: 'is_primary',
+  };
+  const sets = [];
+  const values = [];
+  for (const [key, column] of Object.entries(allowed)) {
+    if (fields[key] === undefined) continue;
+    sets.push(`${column} = ?`);
+    values.push(key === 'isPrimary' ? boolToInt(fields[key]) : fields[key]);
+  }
+  if (!sets.length) return getCleanerServiceAreaById(id);
+  sets.push(`updated_at = datetime('now')`);
+  values.push(id);
+  db.prepare(`UPDATE cleaner_service_areas SET ${sets.join(', ')} WHERE id = ?`).run(...values);
   return getCleanerServiceAreaById(id);
 }
 
@@ -561,12 +882,13 @@ export function createCleanerAvailability({
   startTime,
   endTime,
   isAvailable = true,
+  notes = '',
 }) {
   db.prepare(
     `INSERT INTO cleaner_availability (
-      id, cleaner_profile_id, day_of_week, start_time, end_time, is_available
-    ) VALUES (?, ?, ?, ?, ?, ?)`
-  ).run(id, cleanerProfileId, dayOfWeek, startTime, endTime, boolToInt(isAvailable, 1));
+      id, cleaner_profile_id, day_of_week, start_time, end_time, is_available, notes
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)`
+  ).run(id, cleanerProfileId, dayOfWeek, startTime, endTime, boolToInt(isAvailable, 1), notes);
   return getCleanerAvailabilityById(id);
 }
 
@@ -576,6 +898,7 @@ export function updateCleanerAvailability(id, fields) {
     startTime: 'start_time',
     endTime: 'end_time',
     isAvailable: 'is_available',
+    notes: 'notes',
   };
   const sets = [];
   const values = [];

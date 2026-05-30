@@ -1,6 +1,11 @@
 export * as estimateService from './estimateService.js';
 export * as matchingService from './matchingService.js';
 export * as cleanerProfileService from './cleanerProfileService.js';
+export * as cleanerLanguageService from './cleanerLanguageService.js';
+export * as cleanerServiceAreaService from './cleanerServiceAreaService.js';
+export * as cleanerAvailabilityService from './cleanerAvailabilityService.js';
+export * as cleanerServicesService from './cleanerServicesService.js';
+export * as profileCompletionService from './profileCompletionService.js';
 export * as cleaningRequestService from './cleaningRequestService.js';
 export * as proposalService from './proposalService.js';
 export * as agreementService from './agreementService.js';
