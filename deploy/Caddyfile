@@ -1,4 +1,4 @@
-# HTTPS-only firewall (https-server tag) — plain HTTP on 443 until we have a domain + TLS cert
-http://:443 {
+# Let's Encrypt TLS via Caddy. sslip.io works immediately; custom domain once DNS is set.
+api.bradley.toweringmedia.com, 34-134-19-51.sslip.io {
 	reverse_proxy 127.0.0.1:3847
 }
