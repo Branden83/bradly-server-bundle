@@ -6,6 +6,8 @@ CREATE TABLE IF NOT EXISTS users (
   role TEXT NOT NULL CHECK (role IN ('client', 'cleaner', 'admin')),
   push_token TEXT,
   subscription_status TEXT NOT NULL DEFAULT 'trial',
+  subscription_trial_ends_at TEXT,
+  subscription_expires_at TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -21,6 +23,7 @@ CREATE TABLE IF NOT EXISTS homes (
   name TEXT NOT NULL,
   visit_day INTEGER NOT NULL DEFAULT 2,
   visit_time TEXT NOT NULL DEFAULT '10:00',
+  hourly_rate_cents INTEGER,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -44,6 +47,7 @@ CREATE TABLE IF NOT EXISTS task_templates (
   title TEXT NOT NULL,
   instructions TEXT NOT NULL DEFAULT '',
   cadence TEXT NOT NULL CHECK (cadence IN ('weekly', 'monthly', 'quarterly')),
+  estimated_minutes INTEGER NOT NULL DEFAULT 15,
   active INTEGER NOT NULL DEFAULT 1,
   last_completed_at TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -54,6 +58,8 @@ CREATE TABLE IF NOT EXISTS visits (
   home_id TEXT NOT NULL REFERENCES homes(id) ON DELETE CASCADE,
   scheduled_date TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'scheduled' CHECK (status IN ('scheduled', 'in_progress', 'completed')),
+  cleaner_response TEXT NOT NULL DEFAULT 'pending' CHECK (cleaner_response IN ('pending', 'accepted', 'declined')),
+  cleaner_responded_at TEXT,
   started_at TEXT,
   completed_at TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))

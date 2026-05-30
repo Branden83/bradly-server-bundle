@@ -117,4 +117,54 @@ function migrateAdminAndLicensing() {
 
 migrateAdminAndLicensing();
 
+function migrateTaskEstimatesAndHourlyRate() {
+  const done = db.prepare('SELECT 1 FROM _migrations WHERE name = ?').get('task_estimates_hourly_rate_v1');
+  if (done) return;
+
+  const homeCols = db.prepare('PRAGMA table_info(homes)').all();
+  if (!homeCols.some((c) => c.name === 'hourly_rate_cents')) {
+    db.exec(`ALTER TABLE homes ADD COLUMN hourly_rate_cents INTEGER`);
+  }
+
+  const taskCols = db.prepare('PRAGMA table_info(task_templates)').all();
+  if (!taskCols.some((c) => c.name === 'estimated_minutes')) {
+    db.exec(`ALTER TABLE task_templates ADD COLUMN estimated_minutes INTEGER NOT NULL DEFAULT 15`);
+  }
+
+  db.prepare(`INSERT INTO _migrations (name) VALUES (?)`).run('task_estimates_hourly_rate_v1');
+}
+
+migrateTaskEstimatesAndHourlyRate();
+
+function migrateSubscriptionTrialAndVisitResponse() {
+  const done = db.prepare('SELECT 1 FROM _migrations WHERE name = ?').get('subscription_visit_response_v1');
+  if (done) return;
+
+  const userCols = db.prepare('PRAGMA table_info(users)').all();
+  if (!userCols.some((c) => c.name === 'subscription_trial_ends_at')) {
+    db.exec(`ALTER TABLE users ADD COLUMN subscription_trial_ends_at TEXT`);
+  }
+  if (!userCols.some((c) => c.name === 'subscription_expires_at')) {
+    db.exec(`ALTER TABLE users ADD COLUMN subscription_expires_at TEXT`);
+  }
+
+  db.exec(`
+    UPDATE users
+    SET subscription_trial_ends_at = datetime(created_at, '+14 days')
+    WHERE subscription_trial_ends_at IS NULL
+  `);
+
+  const visitCols = db.prepare('PRAGMA table_info(visits)').all();
+  if (!visitCols.some((c) => c.name === 'cleaner_response')) {
+    db.exec(`ALTER TABLE visits ADD COLUMN cleaner_response TEXT NOT NULL DEFAULT 'pending'`);
+  }
+  if (!visitCols.some((c) => c.name === 'cleaner_responded_at')) {
+    db.exec(`ALTER TABLE visits ADD COLUMN cleaner_responded_at TEXT`);
+  }
+
+  db.prepare(`INSERT INTO _migrations (name) VALUES (?)`).run('subscription_visit_response_v1');
+}
+
+migrateSubscriptionTrialAndVisitResponse();
+
 export default db;

@@ -72,6 +72,100 @@ function auth(req, res, next) {
   }
 }
 
+const TRIAL_DAYS = 14;
+const DEV_SUBSCRIPTION =
+  process.env.NODE_ENV !== 'production' || process.env.BRADLEY_DEV_SUBSCRIPTION === '1';
+
+function getTrialEndsAt(user) {
+  if (user.subscription_trial_ends_at) return user.subscription_trial_ends_at;
+  if (user.created_at) {
+    return db
+      .prepare(`SELECT datetime(?, '+${TRIAL_DAYS} days') as ends`)
+      .get(user.created_at)?.ends;
+  }
+  return null;
+}
+
+function resolveSubscriptionAccess(userRow) {
+  if (!userRow) return { hasAccess: false, reason: 'not_found' };
+  if (isAdminUser({ id: userRow.id })) {
+    return { hasAccess: true, reason: 'admin', effectiveStatus: 'active' };
+  }
+
+  const now = new Date();
+  const trialEndsAt = getTrialEndsAt(userRow);
+
+  if (userRow.subscription_status === 'active') {
+    if (userRow.subscription_expires_at) {
+      const expires = new Date(userRow.subscription_expires_at);
+      if (expires <= now) {
+        db.prepare(`UPDATE users SET subscription_status = 'expired' WHERE id = ?`).run(userRow.id);
+        return { hasAccess: false, reason: 'expired', effectiveStatus: 'expired', trialEndsAt };
+      }
+    }
+    return {
+      hasAccess: true,
+      reason: 'active',
+      effectiveStatus: 'active',
+      trialEndsAt,
+      subscriptionExpiresAt: userRow.subscription_expires_at,
+    };
+  }
+
+  if (userRow.subscription_status === 'trial') {
+    if (trialEndsAt && new Date(trialEndsAt) > now) {
+      return { hasAccess: true, reason: 'trial', effectiveStatus: 'trial', trialEndsAt };
+    }
+    db.prepare(`UPDATE users SET subscription_status = 'expired' WHERE id = ?`).run(userRow.id);
+    return { hasAccess: false, reason: 'trial_expired', effectiveStatus: 'expired', trialEndsAt };
+  }
+
+  return {
+    hasAccess: false,
+    reason: userRow.subscription_status || 'expired',
+    effectiveStatus: userRow.subscription_status || 'expired',
+    trialEndsAt,
+  };
+}
+
+function formatUserSubscription(userRow) {
+  const access = resolveSubscriptionAccess(userRow);
+  return {
+    subscriptionStatus: access.effectiveStatus || userRow.subscription_status,
+    trialEndsAt: access.trialEndsAt ?? getTrialEndsAt(userRow),
+    subscriptionExpiresAt: userRow.subscription_expires_at ?? null,
+    hasSubscriptionAccess: access.hasAccess,
+  };
+}
+
+function requireSubscription(req, res, next) {
+  const user = db
+    .prepare(
+      `SELECT id, email, role, subscription_status, subscription_trial_ends_at,
+              subscription_expires_at, created_at
+       FROM users WHERE id = ?`
+    )
+    .get(req.user.id);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+
+  const access = resolveSubscriptionAccess(user);
+  if (!access.hasAccess) {
+    return res.status(402).json({
+      error: 'Subscription required',
+      subscriptionStatus: access.effectiveStatus,
+      trialEndsAt: access.trialEndsAt ?? null,
+    });
+  }
+  next();
+}
+
+function authRequired(req, res, next) {
+  auth(req, res, () => {
+    if (res.headersSent) return;
+    requireSubscription(req, res, next);
+  });
+}
+
 async function sendExpoPush(tokens, { title, body, data }) {
   const unique = [...new Set(tokens.filter(Boolean))];
   if (!unique.length) return;
@@ -222,7 +316,8 @@ function ensureVisit(homeId, scheduledDate) {
   if (!visit) {
     const id = uuid();
     db.prepare(
-      'INSERT INTO visits (id, home_id, scheduled_date, status) VALUES (?, ?, ?, ?)'
+      `INSERT INTO visits (id, home_id, scheduled_date, status, cleaner_response)
+       VALUES (?, ?, ?, ?, 'pending')`
     ).run(id, homeId, scheduledDate, 'scheduled');
     visit = db.prepare('SELECT * FROM visits WHERE id = ?').get(id);
 
@@ -282,6 +377,22 @@ function nextVisitDate(home) {
   return d.toISOString().slice(0, 10);
 }
 
+function computeVisitEstimates(visitId, hourlyRateCents) {
+  const row = db
+    .prepare(
+      `SELECT COALESCE(SUM(COALESCE(tt.estimated_minutes, 15)), 0) as total
+       FROM visit_tasks vt
+       LEFT JOIN task_templates tt ON tt.id = vt.task_template_id
+       WHERE vt.visit_id = ?`
+    )
+    .get(visitId);
+  const totalEstimatedMinutes = row.total;
+  const rate = hourlyRateCents ?? null;
+  const estimatedCostCents =
+    rate != null ? Math.round((totalEstimatedMinutes * rate) / 60) : null;
+  return { totalEstimatedMinutes, estimatedCostCents, hourlyRateCents: rate };
+}
+
 // ─── Auth ───────────────────────────────────────────────────────────────────
 
 app.post('/auth/register', (req, res) => {
@@ -298,13 +409,22 @@ app.post('/auth/register', (req, res) => {
   const id = uuid();
   const hash = bcrypt.hashSync(password, 10);
   db.prepare(
-    'INSERT INTO users (id, email, password_hash, display_name, role) VALUES (?, ?, ?, ?, ?)'
+    `INSERT INTO users (id, email, password_hash, display_name, role, subscription_status, subscription_trial_ends_at)
+     VALUES (?, ?, ?, ?, ?, 'trial', datetime('now', '+${TRIAL_DAYS} days'))`
   ).run(id, email.toLowerCase(), hash, displayName, role);
 
+  const userRow = db.prepare('SELECT * FROM users WHERE id = ?').get(id);
   const token = jwt.sign({ id, email: email.toLowerCase(), role }, JWT_SECRET, { expiresIn: '30d' });
   res.json({
     token,
-    user: { id, email: email.toLowerCase(), displayName, role, isAdmin: isAdminUser({ id }) },
+    user: {
+      id,
+      email: email.toLowerCase(),
+      displayName,
+      role,
+      isAdmin: isAdminUser({ id }),
+      ...formatUserSubscription(userRow),
+    },
   });
 });
 
@@ -327,16 +447,13 @@ app.post('/auth/login', (req, res) => {
       displayName: user.display_name,
       role: user.role,
       isAdmin: isAdminUser({ id: user.id }),
+      ...formatUserSubscription(user),
     },
   });
 });
 
 app.get('/auth/me', auth, (req, res) => {
-  const user = db
-    .prepare(
-      'SELECT id, email, display_name, role, push_token, subscription_status FROM users WHERE id = ?'
-    )
-    .get(req.user.id);
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.id);
   if (!user) return res.status(404).json({ error: 'User not found' });
   res.json({
     id: user.id,
@@ -344,8 +461,8 @@ app.get('/auth/me', auth, (req, res) => {
     displayName: user.display_name,
     role: user.role,
     pushToken: user.push_token,
-    subscriptionStatus: user.subscription_status,
     isAdmin: isAdminUser(req.user),
+    ...formatUserSubscription(user),
   });
 });
 
@@ -355,9 +472,25 @@ app.put('/auth/push-token', auth, (req, res) => {
   res.json({ ok: true });
 });
 
+// ─── Subscription ───────────────────────────────────────────────────────────
+
+app.post('/subscription/activate-dev', auth, (req, res) => {
+  if (!DEV_SUBSCRIPTION) {
+    return res.status(403).json({ error: 'Play Store billing coming soon' });
+  }
+  const expiresAt = db
+    .prepare(`SELECT datetime('now', '+1 year') as expires`)
+    .get().expires;
+  db.prepare(
+    `UPDATE users SET subscription_status = 'active', subscription_expires_at = ? WHERE id = ?`
+  ).run(expiresAt, req.user.id);
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.id);
+  res.json({ ok: true, ...formatUserSubscription(user) });
+});
+
 // ─── Homes ──────────────────────────────────────────────────────────────────
 
-app.post('/homes', auth, (req, res) => {
+app.post('/homes', authRequired, (req, res) => {
   if (req.user.role !== 'client') {
     return res.status(403).json({ error: 'Only clients can create homes' });
   }
@@ -411,7 +544,7 @@ app.post('/homes', auth, (req, res) => {
   res.json(home);
 });
 
-app.get('/homes/mine', auth, (req, res) => {
+app.get('/homes/mine', authRequired, (req, res) => {
   const home = getHomeForUser(req.user.id);
   if (!home) return res.json(null);
   const rooms = db
@@ -429,7 +562,7 @@ app.get('/homes/mine', auth, (req, res) => {
   res.json({ ...home, rooms, tasks, householdMembers, myHomeRole });
 });
 
-app.get('/homes/:id/household', auth, (req, res) => {
+app.get('/homes/:id/household', authRequired, (req, res) => {
   const home = db.prepare('SELECT * FROM homes WHERE id = ?').get(req.params.id);
   if (!home || !canManageHome(req.user.id, home.id)) {
     return res.status(403).json({ error: 'Not allowed' });
@@ -437,21 +570,38 @@ app.get('/homes/:id/household', auth, (req, res) => {
   res.json({ members: getHouseholdManagers(home.id) });
 });
 
-app.patch('/homes/:id', auth, (req, res) => {
+app.patch('/homes/:id', authRequired, (req, res) => {
   const home = db.prepare('SELECT * FROM homes WHERE id = ?').get(req.params.id);
   if (!home || !canManageHome(req.user.id, home.id)) {
     return res.status(403).json({ error: 'Not allowed' });
   }
-  const { name, visitDay, visitTime } = req.body;
+  const { name, visitDay, visitTime, hourlyRateCents } = req.body;
+  if (hourlyRateCents !== undefined && hourlyRateCents !== null) {
+    if (!Number.isInteger(hourlyRateCents) || hourlyRateCents < 0) {
+      return res.status(400).json({ error: 'Invalid hourly rate' });
+    }
+  }
   db.prepare(
-    'UPDATE homes SET name = COALESCE(?, name), visit_day = COALESCE(?, visit_day), visit_time = COALESCE(?, visit_time) WHERE id = ?'
-  ).run(name ?? null, visitDay ?? null, visitTime ?? null, home.id);
+    `UPDATE homes SET
+      name = COALESCE(?, name),
+      visit_day = COALESCE(?, visit_day),
+      visit_time = COALESCE(?, visit_time),
+      hourly_rate_cents = CASE WHEN ? THEN ? ELSE hourly_rate_cents END
+     WHERE id = ?`
+  ).run(
+    name ?? null,
+    visitDay ?? null,
+    visitTime ?? null,
+    hourlyRateCents !== undefined,
+    hourlyRateCents ?? null,
+    home.id
+  );
   res.json(db.prepare('SELECT * FROM homes WHERE id = ?').get(home.id));
 });
 
 // ─── Invites ────────────────────────────────────────────────────────────────
 
-app.post('/homes/:id/invite', auth, (req, res) => {
+app.post('/homes/:id/invite', authRequired, (req, res) => {
   const home = db.prepare('SELECT * FROM homes WHERE id = ?').get(req.params.id);
   if (!home || !canManageHome(req.user.id, home.id)) {
     return res.status(403).json({ error: 'Not allowed' });
@@ -469,7 +619,7 @@ app.post('/homes/:id/invite', auth, (req, res) => {
   res.json({ code, expiresAt: expires.toISOString(), inviteRole });
 });
 
-app.post('/invites/join', auth, (req, res) => {
+app.post('/invites/join', authRequired, (req, res) => {
   const { code } = req.body;
   const invite = db.prepare('SELECT * FROM invites WHERE code = ?').get(code?.toUpperCase());
   if (!invite) return res.status(404).json({ error: 'Invalid invite code' });
@@ -502,7 +652,7 @@ app.post('/invites/join', auth, (req, res) => {
 
 // ─── Rooms & Tasks ──────────────────────────────────────────────────────────
 
-app.post('/homes/:homeId/rooms', auth, (req, res) => {
+app.post('/homes/:homeId/rooms', authRequired, (req, res) => {
   const home = db.prepare('SELECT * FROM homes WHERE id = ?').get(req.params.homeId);
   if (!home || !canManageHome(req.user.id, home.id)) {
     return res.status(403).json({ error: 'Not allowed' });
@@ -521,27 +671,31 @@ app.post('/homes/:homeId/rooms', auth, (req, res) => {
   res.json(db.prepare('SELECT * FROM rooms WHERE id = ?').get(id));
 });
 
-app.post('/rooms/:roomId/tasks', auth, (req, res) => {
+app.post('/rooms/:roomId/tasks', authRequired, (req, res) => {
   const room = db
     .prepare(`SELECT r.*, r.home_id FROM rooms r WHERE r.id = ?`)
     .get(req.params.roomId);
   if (!room || !canManageHome(req.user.id, room.home_id)) {
     return res.status(403).json({ error: 'Not allowed' });
   }
-  const { title, instructions, cadence } = req.body;
+  const { title, instructions, cadence, estimatedMinutes } = req.body;
   if (!title || !['weekly', 'monthly', 'quarterly'].includes(cadence)) {
     return res.status(400).json({ error: 'Invalid task data' });
   }
+  const minutes = estimatedMinutes ?? 15;
+  if (!Number.isInteger(minutes) || minutes < 1) {
+    return res.status(400).json({ error: 'Invalid estimated minutes' });
+  }
   const id = uuid();
   db.prepare(
-    'INSERT INTO task_templates (id, room_id, title, instructions, cadence) VALUES (?, ?, ?, ?, ?)'
-  ).run(id, room.id, title, instructions || '', cadence);
+    'INSERT INTO task_templates (id, room_id, title, instructions, cadence, estimated_minutes) VALUES (?, ?, ?, ?, ?, ?)'
+  ).run(id, room.id, title, instructions || '', cadence, minutes);
   const template = db.prepare('SELECT * FROM task_templates WHERE id = ?').get(id);
   syncTemplateToUpcomingVisit(room.home_id, template, room.name);
   res.json(template);
 });
 
-app.patch('/tasks/:id', auth, (req, res) => {
+app.patch('/tasks/:id', authRequired, (req, res) => {
   const task = db
     .prepare(
       `SELECT tt.*, r.home_id FROM task_templates tt
@@ -552,19 +706,26 @@ app.patch('/tasks/:id', auth, (req, res) => {
   if (!task || !canManageHome(req.user.id, task.home_id)) {
     return res.status(403).json({ error: 'Not allowed' });
   }
-  const { title, instructions, cadence, active } = req.body;
+  const { title, instructions, cadence, active, estimatedMinutes } = req.body;
+  if (estimatedMinutes !== undefined && estimatedMinutes !== null) {
+    if (!Number.isInteger(estimatedMinutes) || estimatedMinutes < 1) {
+      return res.status(400).json({ error: 'Invalid estimated minutes' });
+    }
+  }
   db.prepare(
     `UPDATE task_templates SET
       title = COALESCE(?, title),
       instructions = COALESCE(?, instructions),
       cadence = COALESCE(?, cadence),
-      active = COALESCE(?, active)
+      active = COALESCE(?, active),
+      estimated_minutes = COALESCE(?, estimated_minutes)
      WHERE id = ?`
   ).run(
     title ?? null,
     instructions ?? null,
     cadence ?? null,
     active === undefined ? null : active ? 1 : 0,
+    estimatedMinutes ?? null,
     task.id
   );
   res.json(db.prepare('SELECT * FROM task_templates WHERE id = ?').get(task.id));
@@ -572,7 +733,7 @@ app.patch('/tasks/:id', auth, (req, res) => {
 
 // ─── Visits ─────────────────────────────────────────────────────────────────
 
-app.get('/visits/upcoming', auth, async (req, res) => {
+app.get('/visits/upcoming', authRequired, async (req, res) => {
   const home = getHomeForUser(req.user.id);
   if (!home) return res.json(null);
 
@@ -593,7 +754,12 @@ app.get('/visits/upcoming', auth, async (req, res) => {
     return { ...t, questions };
   });
 
-  const payload = { visit, tasks: tasksWithQuestions, home };
+  const payload = {
+    visit,
+    tasks: tasksWithQuestions,
+    home,
+    ...computeVisitEstimates(visit.id, home.hourly_rate_cents),
+  };
 
   if (req.user.role === 'cleaner') {
     try {
@@ -612,7 +778,7 @@ app.get('/visits/upcoming', auth, async (req, res) => {
   res.json(payload);
 });
 
-app.get('/visits/history', auth, (req, res) => {
+app.get('/visits/history', authRequired, (req, res) => {
   const home = getHomeForUser(req.user.id);
   if (!home) return res.json([]);
   const visits = db
@@ -624,7 +790,7 @@ app.get('/visits/history', auth, (req, res) => {
   res.json(visits);
 });
 
-app.get('/visits/:id', auth, (req, res) => {
+app.get('/visits/:id', authRequired, (req, res) => {
   const visit = db.prepare('SELECT * FROM visits WHERE id = ?').get(req.params.id);
   if (!visit) return res.status(404).json({ error: 'Not found' });
   const home = getHomeForUser(req.user.id);
@@ -647,12 +813,64 @@ app.get('/visits/:id', auth, (req, res) => {
   res.json({ visit, tasks: tasksWithQuestions });
 });
 
-app.post('/visits/:id/start', auth, (req, res) => {
+app.post('/visits/:id/respond', authRequired, (req, res) => {
+  const visit = db.prepare('SELECT * FROM visits WHERE id = ?').get(req.params.id);
+  if (!visit) return res.status(404).json({ error: 'Not found' });
+
+  const homeRole = getUserHomeRole(req.user.id, visit.home_id);
+  if (homeRole !== 'cleaner') {
+    return res.status(403).json({ error: 'Only the assigned cleaner can respond to this visit' });
+  }
+  if (visit.status !== 'scheduled') {
+    return res.status(400).json({ error: 'Visit is no longer scheduled' });
+  }
+  if (visit.cleaner_response !== 'pending') {
+    return res.status(409).json({ error: 'You already responded to this visit' });
+  }
+
+  const { response } = req.body;
+  if (!['accepted', 'declined'].includes(response)) {
+    return res.status(400).json({ error: 'Response must be accepted or declined' });
+  }
+
+  db.prepare(
+    `UPDATE visits SET cleaner_response = ?, cleaner_responded_at = datetime('now') WHERE id = ?`
+  ).run(response, visit.id);
+
+  const updated = db.prepare('SELECT * FROM visits WHERE id = ?').get(visit.id);
+  const home = db.prepare('SELECT name FROM homes WHERE id = ?').get(visit.home_id);
+  const cleaner = db.prepare('SELECT display_name FROM users WHERE id = ?').get(req.user.id);
+  const managerTokens = getHouseholdManagerPushTokens(visit.home_id, req.user.id);
+
+  const accepted = response === 'accepted';
+  void sendExpoPush(managerTokens, {
+    title: accepted ? 'Cleaner accepted job' : 'Cleaner declined job',
+    body: accepted
+      ? `${cleaner?.display_name || 'Your cleaner'} accepted the ${visit.scheduled_date} visit at ${home?.name || 'your home'}.`
+      : `${cleaner?.display_name || 'Your cleaner'} declined the ${visit.scheduled_date} visit. You may need to find another cleaner or reschedule.`,
+    data: { type: accepted ? 'visit_accepted' : 'visit_declined', visitId: visit.id },
+  });
+
+  res.json(updated);
+});
+
+app.post('/visits/:id/start', authRequired, (req, res) => {
   const visit = db.prepare('SELECT * FROM visits WHERE id = ?').get(req.params.id);
   if (!visit) return res.status(404).json({ error: 'Not found' });
   if (visit.status !== 'scheduled') {
     return res.json(db.prepare('SELECT * FROM visits WHERE id = ?').get(visit.id));
   }
+
+  const homeRole = getUserHomeRole(req.user.id, visit.home_id);
+  if (homeRole === 'cleaner' && visit.cleaner_response !== 'accepted') {
+    return res.status(403).json({
+      error:
+        visit.cleaner_response === 'declined'
+          ? 'You declined this visit'
+          : 'Accept the job before starting the visit',
+    });
+  }
+
   db.prepare(
     `UPDATE visits SET status = 'in_progress', started_at = datetime('now') WHERE id = ?`
   ).run(visit.id);
@@ -669,7 +887,7 @@ app.post('/visits/:id/start', auth, (req, res) => {
   res.json(db.prepare('SELECT * FROM visits WHERE id = ?').get(visit.id));
 });
 
-app.patch('/visit-tasks/:id', auth, (req, res) => {
+app.patch('/visit-tasks/:id', authRequired, (req, res) => {
   const vt = db
     .prepare(
       `SELECT vt.*, v.home_id, v.id as visit_id, v.status as visit_status
@@ -697,7 +915,7 @@ app.patch('/visit-tasks/:id', auth, (req, res) => {
   res.json(db.prepare('SELECT * FROM visit_tasks WHERE id = ?').get(vt.id));
 });
 
-app.post('/visits/:id/complete', auth, (req, res) => {
+app.post('/visits/:id/complete', authRequired, (req, res) => {
   const visit = db.prepare('SELECT * FROM visits WHERE id = ?').get(req.params.id);
   if (!visit) return res.status(404).json({ error: 'Not found' });
 
@@ -724,7 +942,7 @@ app.post('/visits/:id/complete', auth, (req, res) => {
   });
 });
 
-app.post('/visits/:id/feedback', auth, (req, res) => {
+app.post('/visits/:id/feedback', authRequired, (req, res) => {
   const visit = db.prepare('SELECT * FROM visits WHERE id = ?').get(req.params.id);
   if (!visit) return res.status(404).json({ error: 'Not found' });
   if (visit.status !== 'completed') {
@@ -782,7 +1000,7 @@ app.post('/visits/:id/feedback', auth, (req, res) => {
   res.status(201).json(row);
 });
 
-app.get('/homes/:homeId/feedback', auth, (req, res) => {
+app.get('/homes/:homeId/feedback', authRequired, (req, res) => {
   const role = getUserHomeRole(req.user.id, req.params.homeId);
   if (!role) return res.status(403).json({ error: 'Not a member of this home' });
 
@@ -802,7 +1020,7 @@ app.get('/homes/:homeId/feedback', auth, (req, res) => {
 
 // ─── Questions ──────────────────────────────────────────────────────────────
 
-app.post('/visit-tasks/:id/questions', auth, (req, res) => {
+app.post('/visit-tasks/:id/questions', authRequired, (req, res) => {
   const vt = db
     .prepare(
       `SELECT vt.*, v.home_id FROM visit_tasks vt JOIN visits v ON v.id = vt.visit_id WHERE vt.id = ?`
@@ -853,7 +1071,7 @@ app.post('/visit-tasks/:id/questions', auth, (req, res) => {
   res.json(question);
 });
 
-app.get('/notifications/unread-count', auth, (req, res) => {
+app.get('/notifications/unread-count', authRequired, (req, res) => {
   const home = getHomeForUser(req.user.id);
   if (!home) return res.json({ count: 0 });
 
@@ -882,7 +1100,7 @@ app.get('/notifications/unread-count', auth, (req, res) => {
 
 // ─── Payment methods (cleaner receive handles) ──────────────────────────────
 
-app.get('/payment-methods/mine', auth, (req, res) => {
+app.get('/payment-methods/mine', authRequired, (req, res) => {
   const row = db.prepare('SELECT * FROM payment_methods WHERE user_id = ?').get(req.user.id);
   res.json(
     row || {
@@ -895,7 +1113,7 @@ app.get('/payment-methods/mine', auth, (req, res) => {
   );
 });
 
-app.get('/payment-methods/cleaner/:cleanerId', auth, (req, res) => {
+app.get('/payment-methods/cleaner/:cleanerId', authRequired, (req, res) => {
   const home = getHomeForUser(req.user.id);
   if (!home) return res.status(403).json({ error: 'No home' });
 
@@ -924,7 +1142,7 @@ app.get('/payment-methods/cleaner/:cleanerId', auth, (req, res) => {
   });
 });
 
-app.put('/payment-methods/mine', auth, (req, res) => {
+app.put('/payment-methods/mine', authRequired, (req, res) => {
   if (req.user.role !== 'cleaner') {
     return res.status(403).json({ error: 'Only cleaners can set payment methods' });
   }
@@ -972,7 +1190,7 @@ function invoiceRow(id) {
     .get(id);
 }
 
-app.get('/invoices', auth, (req, res) => {
+app.get('/invoices', authRequired, (req, res) => {
   const home = getHomeForUser(req.user.id);
   if (!home) return res.json([]);
 
@@ -1003,7 +1221,7 @@ app.get('/invoices', auth, (req, res) => {
   res.json(rows);
 });
 
-app.post('/invoices', auth, (req, res) => {
+app.post('/invoices', authRequired, (req, res) => {
   if (req.user.role !== 'cleaner') {
     return res.status(403).json({ error: 'Only cleaners can send invoices' });
   }
@@ -1046,7 +1264,7 @@ app.post('/invoices', auth, (req, res) => {
   res.json(invoiceRow(id));
 });
 
-app.get('/invoices/:id', auth, (req, res) => {
+app.get('/invoices/:id', authRequired, (req, res) => {
   const invoice = invoiceRow(req.params.id);
   if (!invoice) return res.status(404).json({ error: 'Not found' });
   const home = getHomeForUser(req.user.id);
@@ -1057,7 +1275,7 @@ app.get('/invoices/:id', auth, (req, res) => {
   res.json({ invoice, paymentMethods: methods || {} });
 });
 
-app.patch('/invoices/:id/paid', auth, (req, res) => {
+app.patch('/invoices/:id/paid', authRequired, (req, res) => {
   const invoice = db.prepare('SELECT * FROM invoices WHERE id = ?').get(req.params.id);
   if (!invoice) return res.status(404).json({ error: 'Not found' });
 
@@ -1084,7 +1302,7 @@ app.patch('/invoices/:id/paid', auth, (req, res) => {
   res.json(invoiceRow(invoice.id));
 });
 
-app.patch('/invoices/:id/cancel', auth, (req, res) => {
+app.patch('/invoices/:id/cancel', authRequired, (req, res) => {
   const invoice = db.prepare('SELECT * FROM invoices WHERE id = ?').get(req.params.id);
   if (!invoice) return res.status(404).json({ error: 'Not found' });
   if (invoice.cleaner_id !== req.user.id) {
@@ -1118,7 +1336,7 @@ function deleteUserByEmail(email) {
   return true;
 }
 
-app.get('/admin/users', auth, requireAdmin, (_req, res) => {
+app.get('/admin/users', authRequired, requireAdmin, (_req, res) => {
   const users = db
     .prepare(
       `SELECT id, email, display_name, role, subscription_status, created_at
@@ -1137,7 +1355,7 @@ app.get('/admin/users', auth, requireAdmin, (_req, res) => {
   });
 });
 
-app.delete('/admin/users/:email', auth, requireAdmin, (req, res) => {
+app.delete('/admin/users/:email', authRequired, requireAdmin, (req, res) => {
   const email = decodeURIComponent(req.params.email || '').toLowerCase();
   if (!email) return res.status(400).json({ error: 'Email required' });
   if (email === req.user.email?.toLowerCase()) {
@@ -1148,7 +1366,7 @@ app.delete('/admin/users/:email', auth, requireAdmin, (req, res) => {
   res.json({ ok: true });
 });
 
-app.get('/admin/settings', auth, requireAdmin, (_req, res) => {
+app.get('/admin/settings', authRequired, requireAdmin, (_req, res) => {
   const rows = db.prepare('SELECT key, value, updated_at FROM app_settings ORDER BY key').all();
   const settings = {};
   for (const row of rows) {
@@ -1157,7 +1375,7 @@ app.get('/admin/settings', auth, requireAdmin, (_req, res) => {
   res.json({ settings });
 });
 
-app.put('/admin/settings', auth, requireAdmin, (req, res) => {
+app.put('/admin/settings', authRequired, requireAdmin, (req, res) => {
   const body = req.body || {};
   if (typeof body !== 'object' || Array.isArray(body)) {
     return res.status(400).json({ error: 'Invalid settings body' });
