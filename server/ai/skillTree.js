@@ -2,25 +2,19 @@
  * Skill Tree Router
  *
  * Architecture:
- *   visit_feedback (needs_improvement) → AI/local theme detection → skillTree router → focus reminders
+ *   visit_feedback (needs_improvement) → AI/local theme detection → skillTree router → client-preference reminders
  *
- * The skill tree is a flat map of performance skills (not a deep RPG tree). Each skill node
- * bundles related improvement themes with actionable reminders cleaners see before a visit.
- *
- * Flow:
- *   1. reminders.js collects historical needs_improvement text for a home
- *   2. Repeated themes are extracted (OpenAI or local keyword clustering)
- *   3. routeThemesToSkills() scores each skill against those themes
- *   4. buildFocusReminders() returns 1–4 short strings for the upcoming visit UI
+ * Reminders are framed as client preferences — never raw criticism — before cleaners see them on a visit.
  */
 
-/** @typedef {{ id: string; label: string; themePatterns: RegExp[]; reminders: string[] }} SkillNode */
+/** @typedef {{ id: string; label: string; preferencePhrase: string; themePatterns: RegExp[]; reminders: string[] }} SkillNode */
 
 /** @type {Record<string, SkillNode>} */
 export const SKILL_TREE = {
   thoroughness: {
     id: 'thoroughness',
     label: 'Thoroughness',
+    preferencePhrase: 'values thorough, detailed cleaning',
     themePatterns: [
       /\b(miss(ed|ing)?|forgot|incomplete|half.?done|skipped|overlook)\b/i,
       /\b(detail|corner|edge|spot|crumb|dust|hair|streak|smear|film)\b/i,
@@ -28,73 +22,76 @@ export const SKILL_TREE = {
       /\b(thorough|deep.?clean|touch.?up)\b/i,
     ],
     reminders: [
-      'Slow down in each room — check corners, edges, and hidden spots before moving on.',
-      'Use a top-to-bottom, back-to-front pattern so nothing gets missed.',
-      'Re-walk each room once before leaving to catch anything you skipped.',
+      'Consider a quick final walk-through in each room before moving on.',
+      'A top-to-bottom, back-to-front pattern can help cover easy-to-miss spots.',
     ],
   },
   communication: {
     id: 'communication',
     label: 'Communication',
+    preferencePhrase: 'appreciates proactive updates',
     themePatterns: [
       /\b(communicat(e|ion|ing)?|respond|reply|answer|text|call|message)\b/i,
       /\b(update|let.?me.?know|heads.?up|confirm|check.?in)\b/i,
       /\b(unprofessional|rude|attitude|ignore)\b/i,
     ],
     reminders: [
-      'Send a quick check-in when you arrive and before you leave.',
-      'Reply to client questions the same day — even a short update helps.',
-      'Flag anything blocked or skipped so the client is not surprised.',
+      'A brief check-in when you arrive and before you leave often goes a long way.',
+      'Same-day replies to questions — even short ones — help this client feel in the loop.',
     ],
   },
   punctuality: {
     id: 'punctuality',
     label: 'Punctuality',
+    preferencePhrase: 'especially values punctuality',
     themePatterns: [
       /\b(late|on.?time|punctual|schedule|window|no.?show|cancel)\b/i,
       /\b(wait(ed|ing)?|delay|behind|early|reschedul)\b/i,
     ],
     reminders: [
-      'Plan to arrive a few minutes early — clients notice consistency.',
-      'If you will be late, message the client as soon as you know.',
+      'Consider confirming timing before the next visit.',
+      'If plans change, an early heads-up helps this client adjust their day.',
     ],
   },
   organization: {
     id: 'organization',
     label: 'Organization',
+    preferencePhrase: 'likes tidy, reset surfaces',
     themePatterns: [
       /\b(organiz(e|ation|ing)?|tidy|neat|put.?away|clutter|mess)\b/i,
       /\b(straighten|align|fold|stack|sort|reset)\b/i,
       /\b(pillow|towel|bed|counter|surface)\b/i,
     ],
     reminders: [
-      'Reset surfaces — straighten pillows, fold towels, and align items neatly.',
-      'Put things back where you found them; do not leave items out of place.',
+      'Straightening pillows, folding towels, and resetting surfaces tends to stand out here.',
+      'Returning items to where you found them matches how this client likes things left.',
     ],
   },
   product_care: {
     id: 'product_care',
     label: 'Product & surface care',
+    preferencePhrase: 'is careful about surfaces and products',
     themePatterns: [
       /\b(scratch|damage|break|chip|stain|mark|ruin|wrong.?product)\b/i,
       /\b(wood|marble|granite|stainless|delicate|fragile|handle)\b/i,
       /\b(chemical|bleach|harsh|smell|residue)\b/i,
     ],
     reminders: [
-      'Match cleaning products to the surface — when unsure, ask before using something new.',
-      'Test unfamiliar products in a hidden spot first.',
+      'When unsure about a product, a quick ask before trying something new is appreciated.',
+      'Testing unfamiliar products in a hidden spot first aligns with this client\'s preferences.',
     ],
   },
   consistency: {
     id: 'consistency',
     label: 'Consistency',
+    preferencePhrase: 'values steady, predictable quality',
     themePatterns: [
       /\b(inconsistent|different|varies|sometimes|usually|always|never)\b/i,
       /\b(standard|same|quality|sloppy|rushed|careless)\b/i,
     ],
     reminders: [
-      'Follow the same checklist every visit so quality stays predictable.',
-      'Do not rush the last rooms — finish with the same attention you started with.',
+      'Following the same checklist each visit helps match what this client expects.',
+      'Saving the same attention for the last rooms as the first keeps quality even.',
     ],
   },
 };
@@ -164,7 +161,7 @@ export function routeThemesToSkills(themes) {
 }
 
 /**
- * Build short focus reminders from matched skills (one per skill, max 4).
+ * Build gentle client-preference reminders from matched skills (max 4).
  * @param {SkillNode[]} skills
  * @returns {string[]}
  */
@@ -173,7 +170,8 @@ export function buildFocusReminders(skills) {
   const seen = new Set();
 
   for (const skill of skills) {
-    for (const line of skill.reminders) {
+    for (const tip of skill.reminders) {
+      const line = `Recent feedback suggests this client ${skill.preferencePhrase}. ${tip}`;
       if (seen.has(line)) continue;
       seen.add(line);
       reminders.push(line);

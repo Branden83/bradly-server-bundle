@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS task_templates (
   instructions TEXT NOT NULL DEFAULT '',
   cadence TEXT NOT NULL CHECK (cadence IN ('weekly', 'monthly', 'quarterly')),
   estimated_minutes INTEGER NOT NULL DEFAULT 15,
+  priority TEXT NOT NULL DEFAULT 'must' CHECK (priority IN ('must', 'nice', 'skip_visit')),
   active INTEGER NOT NULL DEFAULT 1,
   last_completed_at TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -60,6 +61,8 @@ CREATE TABLE IF NOT EXISTS visits (
   status TEXT NOT NULL DEFAULT 'scheduled' CHECK (status IN ('scheduled', 'in_progress', 'completed')),
   cleaner_response TEXT NOT NULL DEFAULT 'pending' CHECK (cleaner_response IN ('pending', 'accepted', 'declined')),
   cleaner_responded_at TEXT,
+  decline_reason TEXT,
+  decline_reason_text TEXT,
   started_at TEXT,
   completed_at TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -73,6 +76,7 @@ CREATE TABLE IF NOT EXISTS visit_tasks (
   title TEXT NOT NULL,
   instructions TEXT NOT NULL DEFAULT '',
   cadence TEXT NOT NULL,
+  priority TEXT NOT NULL DEFAULT 'must' CHECK (priority IN ('must', 'nice', 'skip_visit')),
   status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'done', 'skipped', 'blocked')),
   skip_reason TEXT,
   completed_at TEXT

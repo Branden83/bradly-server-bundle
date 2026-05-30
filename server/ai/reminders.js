@@ -66,7 +66,7 @@ async function detectRepeatedThemesWithAI(apiKey, feedbackRows) {
       {
         role: 'system',
         content:
-          'You analyze recurring themes in homeowner cleaning feedback. Only flag themes that appear in at least two separate comments or are clearly repeated concerns. Return JSON: {"themes":["theme one","theme two"]}. Use short lowercase theme labels (2-4 words). If nothing repeats, return {"themes":[]}.',
+          'You analyze recurring themes in homeowner cleaning feedback to help cleaners understand client preferences. Only flag themes that appear in at least two separate comments or are clearly repeated. Never quote or paraphrase harsh criticism. Return JSON: {"themes":["theme one","theme two"]}. Use short lowercase theme labels (2-4 words). If nothing repeats, return {"themes":[]}.',
       },
       {
         role: 'user',

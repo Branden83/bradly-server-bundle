@@ -14,6 +14,28 @@ const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
 const DEFAULT_ADMIN_EMAILS = 'brandenthomas@gmail.com,branden.thomas@toweringmedia.com';
 const SENSITIVE_SETTING_KEYS = new Set(['openai_api_key']);
 
+const DECLINE_REASONS = {
+  schedule_conflict: 'Schedule conflict',
+  rate_too_low: 'Rate too low',
+  too_far: 'Too far away',
+  not_good_fit: 'Not a good fit',
+  other: 'Other',
+};
+
+function formatDeclineReason(visit) {
+  if (!visit?.decline_reason) return null;
+  const label = DECLINE_REASONS[visit.decline_reason] || visit.decline_reason;
+  if (visit.decline_reason === 'other' && visit.decline_reason_text?.trim()) {
+    return `${label}: ${visit.decline_reason_text.trim()}`;
+  }
+  return label;
+}
+
+function normalizeTaskPriority(priority) {
+  if (['must', 'nice', 'skip_visit'].includes(priority)) return priority;
+  return null;
+}
+
 function parseAdminEmails() {
   return (process.env.ADMIN_EMAILS || DEFAULT_ADMIN_EMAILS)
     .split(',')
@@ -86,10 +108,36 @@ function getTrialEndsAt(user) {
   return null;
 }
 
-function resolveSubscriptionAccess(userRow) {
+function resolveSubscriptionAccess(userRow, options = {}) {
+  const { skipCleanerBypass = false } = options;
   if (!userRow) return { hasAccess: false, reason: 'not_found' };
   if (isAdminUser({ id: userRow.id })) {
     return { hasAccess: true, reason: 'admin', effectiveStatus: 'active' };
+  }
+
+  if (!skipCleanerBypass && userRow.role === 'cleaner') {
+    const owners = db
+      .prepare(
+        `SELECT u.id, u.email, u.role, u.subscription_status, u.subscription_trial_ends_at,
+                u.subscription_expires_at, u.created_at
+         FROM homes h
+         JOIN home_members hm ON hm.home_id = h.id AND hm.user_id = ? AND hm.role = 'cleaner'
+         JOIN users u ON u.id = h.owner_id`
+      )
+      .all(userRow.id);
+
+    for (const owner of owners) {
+      const ownerAccess = resolveSubscriptionAccess(owner, { skipCleanerBypass: true });
+      if (ownerAccess.hasAccess) {
+        return {
+          hasAccess: true,
+          reason: 'cleaner_invited_by_paying_owner',
+          effectiveStatus: 'active',
+          trialEndsAt: ownerAccess.trialEndsAt,
+          subscriptionExpiresAt: ownerAccess.subscriptionExpiresAt,
+        };
+      }
+    }
   }
 
   const now = new Date();
@@ -323,11 +371,20 @@ function ensureVisit(homeId, scheduledDate) {
 
     const due = buildVisitTasks(homeId, scheduledDate);
     const insert = db.prepare(
-      `INSERT INTO visit_tasks (id, visit_id, task_template_id, room_name, title, instructions, cadence, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')`
+      `INSERT INTO visit_tasks (id, visit_id, task_template_id, room_name, title, instructions, cadence, priority, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')`
     );
     for (const t of due) {
-      insert.run(uuid(), visit.id, t.id, t.room_name, t.title, t.instructions, t.cadence);
+      insert.run(
+        uuid(),
+        visit.id,
+        t.id,
+        t.room_name,
+        t.title,
+        t.instructions,
+        t.cadence,
+        t.priority || 'must'
+      );
     }
   }
 
@@ -351,8 +408,8 @@ function syncTemplateToUpcomingVisit(homeId, template, roomName) {
   if (existing) return;
 
   db.prepare(
-    `INSERT INTO visit_tasks (id, visit_id, task_template_id, room_name, title, instructions, cadence, status)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')`
+    `INSERT INTO visit_tasks (id, visit_id, task_template_id, room_name, title, instructions, cadence, priority, status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')`
   ).run(
     uuid(),
     visit.id,
@@ -360,7 +417,8 @@ function syncTemplateToUpcomingVisit(homeId, template, roomName) {
     roomName,
     template.title,
     template.instructions,
-    template.cadence
+    template.cadence,
+    template.priority || 'must'
   );
 }
 
@@ -391,6 +449,71 @@ function computeVisitEstimates(visitId, hourlyRateCents) {
   const estimatedCostCents =
     rate != null ? Math.round((totalEstimatedMinutes * rate) / 60) : null;
   return { totalEstimatedMinutes, estimatedCostCents, hourlyRateCents: rate };
+}
+
+function buildVisitSummary(visitId, homeId, userId, userRole) {
+  const home = db.prepare('SELECT hourly_rate_cents FROM homes WHERE id = ?').get(homeId);
+  const estimates = computeVisitEstimates(visitId, home?.hourly_rate_cents);
+  const tasks = db
+    .prepare('SELECT * FROM visit_tasks WHERE visit_id = ? ORDER BY room_name, title')
+    .all(visitId);
+  const questionsCount = db
+    .prepare(
+      `SELECT COUNT(*) as c FROM task_questions q
+       JOIN visit_tasks vt ON vt.id = q.visit_task_id
+       WHERE vt.visit_id = ?`
+    )
+    .get(visitId).c;
+
+  const done = tasks.filter((t) => t.status === 'done');
+  const skipped = tasks.filter((t) => t.status === 'skipped');
+  const pending = tasks.filter((t) => t.status === 'pending');
+  const blocked = tasks.filter((t) => t.status === 'blocked');
+
+  const feedbackRow = db
+    .prepare('SELECT id FROM visit_feedback WHERE visit_id = ? LIMIT 1')
+    .get(visitId);
+
+  let invoiceRow = null;
+  if (userRole === 'cleaner') {
+    invoiceRow = db
+      .prepare(
+        `SELECT id, status FROM invoices
+         WHERE visit_id = ? AND cleaner_id = ?
+         ORDER BY created_at DESC LIMIT 1`
+      )
+      .get(visitId, userId);
+  } else {
+    invoiceRow = db
+      .prepare(`SELECT id, status FROM invoices WHERE visit_id = ? ORDER BY created_at DESC LIMIT 1`)
+      .get(visitId);
+  }
+
+  return {
+    done: done.length,
+    skipped: skipped.length,
+    pending: pending.length,
+    blocked: blocked.length,
+    total: tasks.length,
+    questionsCount,
+    totalEstimatedMinutes: estimates.totalEstimatedMinutes,
+    estimatedCostCents: estimates.estimatedCostCents,
+    tasksCompleted: done.map((t) => ({
+      id: t.id,
+      title: t.title,
+      room_name: t.room_name,
+      priority: t.priority || 'must',
+    })),
+    tasksSkipped: skipped.map((t) => ({
+      id: t.id,
+      title: t.title,
+      room_name: t.room_name,
+      skip_reason: t.skip_reason,
+      priority: t.priority || 'must',
+    })),
+    feedbackSubmitted: !!feedbackRow,
+    invoice: invoiceRow ? { id: invoiceRow.id, status: invoiceRow.status } : null,
+  };
 }
 
 // ─── Auth ───────────────────────────────────────────────────────────────────
@@ -678,7 +801,7 @@ app.post('/rooms/:roomId/tasks', authRequired, (req, res) => {
   if (!room || !canManageHome(req.user.id, room.home_id)) {
     return res.status(403).json({ error: 'Not allowed' });
   }
-  const { title, instructions, cadence, estimatedMinutes } = req.body;
+  const { title, instructions, cadence, estimatedMinutes, priority } = req.body;
   if (!title || !['weekly', 'monthly', 'quarterly'].includes(cadence)) {
     return res.status(400).json({ error: 'Invalid task data' });
   }
@@ -686,10 +809,14 @@ app.post('/rooms/:roomId/tasks', authRequired, (req, res) => {
   if (!Number.isInteger(minutes) || minutes < 1) {
     return res.status(400).json({ error: 'Invalid estimated minutes' });
   }
+  const taskPriority = priority !== undefined ? normalizeTaskPriority(priority) : 'must';
+  if (priority !== undefined && !taskPriority) {
+    return res.status(400).json({ error: 'Invalid task priority' });
+  }
   const id = uuid();
   db.prepare(
-    'INSERT INTO task_templates (id, room_id, title, instructions, cadence, estimated_minutes) VALUES (?, ?, ?, ?, ?, ?)'
-  ).run(id, room.id, title, instructions || '', cadence, minutes);
+    'INSERT INTO task_templates (id, room_id, title, instructions, cadence, estimated_minutes, priority) VALUES (?, ?, ?, ?, ?, ?, ?)'
+  ).run(id, room.id, title, instructions || '', cadence, minutes, taskPriority);
   const template = db.prepare('SELECT * FROM task_templates WHERE id = ?').get(id);
   syncTemplateToUpcomingVisit(room.home_id, template, room.name);
   res.json(template);
@@ -706,11 +833,14 @@ app.patch('/tasks/:id', authRequired, (req, res) => {
   if (!task || !canManageHome(req.user.id, task.home_id)) {
     return res.status(403).json({ error: 'Not allowed' });
   }
-  const { title, instructions, cadence, active, estimatedMinutes } = req.body;
+  const { title, instructions, cadence, active, estimatedMinutes, priority } = req.body;
   if (estimatedMinutes !== undefined && estimatedMinutes !== null) {
     if (!Number.isInteger(estimatedMinutes) || estimatedMinutes < 1) {
       return res.status(400).json({ error: 'Invalid estimated minutes' });
     }
+  }
+  if (priority !== undefined && priority !== null && !normalizeTaskPriority(priority)) {
+    return res.status(400).json({ error: 'Invalid task priority' });
   }
   db.prepare(
     `UPDATE task_templates SET
@@ -718,7 +848,8 @@ app.patch('/tasks/:id', authRequired, (req, res) => {
       instructions = COALESCE(?, instructions),
       cadence = COALESCE(?, cadence),
       active = COALESCE(?, active),
-      estimated_minutes = COALESCE(?, estimated_minutes)
+      estimated_minutes = COALESCE(?, estimated_minutes),
+      priority = COALESCE(?, priority)
      WHERE id = ?`
   ).run(
     title ?? null,
@@ -726,6 +857,7 @@ app.patch('/tasks/:id', authRequired, (req, res) => {
     cadence ?? null,
     active === undefined ? null : active ? 1 : 0,
     estimatedMinutes ?? null,
+    priority ?? null,
     task.id
   );
   res.json(db.prepare('SELECT * FROM task_templates WHERE id = ?').get(task.id));
@@ -755,7 +887,10 @@ app.get('/visits/upcoming', authRequired, async (req, res) => {
   });
 
   const payload = {
-    visit,
+    visit: {
+      ...visit,
+      declineReasonLabel: formatDeclineReason(visit),
+    },
     tasks: tasksWithQuestions,
     home,
     ...computeVisitEstimates(visit.id, home.hourly_rate_cents),
@@ -810,7 +945,14 @@ app.get('/visits/:id', authRequired, (req, res) => {
       .all(t.id);
     return { ...t, questions };
   });
-  res.json({ visit, tasks: tasksWithQuestions });
+  res.json({
+    visit: {
+      ...visit,
+      declineReasonLabel: formatDeclineReason(visit),
+    },
+    tasks: tasksWithQuestions,
+    ...computeVisitEstimates(visit.id, home.hourly_rate_cents),
+  });
 });
 
 app.post('/visits/:id/respond', authRequired, (req, res) => {
@@ -828,16 +970,36 @@ app.post('/visits/:id/respond', authRequired, (req, res) => {
     return res.status(409).json({ error: 'You already responded to this visit' });
   }
 
-  const { response } = req.body;
+  const { response, declineReason, declineReasonText } = req.body;
   if (!['accepted', 'declined'].includes(response)) {
     return res.status(400).json({ error: 'Response must be accepted or declined' });
   }
 
+  if (response === 'declined') {
+    if (!declineReason || !DECLINE_REASONS[declineReason]) {
+      return res.status(400).json({ error: 'Decline reason required' });
+    }
+    if (declineReason === 'other' && !declineReasonText?.trim()) {
+      return res.status(400).json({ error: 'Please describe your reason' });
+    }
+  }
+
   db.prepare(
-    `UPDATE visits SET cleaner_response = ?, cleaner_responded_at = datetime('now') WHERE id = ?`
-  ).run(response, visit.id);
+    `UPDATE visits SET
+      cleaner_response = ?,
+      cleaner_responded_at = datetime('now'),
+      decline_reason = ?,
+      decline_reason_text = ?
+     WHERE id = ?`
+  ).run(
+    response,
+    response === 'declined' ? declineReason : null,
+    response === 'declined' ? declineReasonText?.trim() || null : null,
+    visit.id
+  );
 
   const updated = db.prepare('SELECT * FROM visits WHERE id = ?').get(visit.id);
+  const declineLabel = formatDeclineReason(updated);
   const home = db.prepare('SELECT name FROM homes WHERE id = ?').get(visit.home_id);
   const cleaner = db.prepare('SELECT display_name FROM users WHERE id = ?').get(req.user.id);
   const managerTokens = getHouseholdManagerPushTokens(visit.home_id, req.user.id);
@@ -847,11 +1009,14 @@ app.post('/visits/:id/respond', authRequired, (req, res) => {
     title: accepted ? 'Cleaner accepted job' : 'Cleaner declined job',
     body: accepted
       ? `${cleaner?.display_name || 'Your cleaner'} accepted the ${visit.scheduled_date} visit at ${home?.name || 'your home'}.`
-      : `${cleaner?.display_name || 'Your cleaner'} declined the ${visit.scheduled_date} visit. You may need to find another cleaner or reschedule.`,
+      : `${cleaner?.display_name || 'Your cleaner'} declined the ${visit.scheduled_date} visit${declineLabel ? ` (${declineLabel})` : ''}. You may need to find another cleaner or reschedule.`,
     data: { type: accepted ? 'visit_accepted' : 'visit_declined', visitId: visit.id },
   });
 
-  res.json(updated);
+  res.json({
+    ...updated,
+    declineReasonLabel: declineLabel,
+  });
 });
 
 app.post('/visits/:id/start', authRequired, (req, res) => {
@@ -928,6 +1093,8 @@ app.post('/visits/:id/complete', authRequired, (req, res) => {
   const skipped = tasks.filter((t) => t.status === 'skipped').length;
   const pending = tasks.filter((t) => t.status === 'pending').length;
 
+  const summary = buildVisitSummary(visit.id, visit.home_id, req.user.id, req.user.role);
+
   const ownerId = getOwnerId(visit.home_id);
   const owner = db.prepare('SELECT push_token FROM users WHERE id = ?').get(ownerId);
   void sendExpoPush([owner?.push_token], {
@@ -938,7 +1105,7 @@ app.post('/visits/:id/complete', authRequired, (req, res) => {
 
   res.json({
     visit: db.prepare('SELECT * FROM visits WHERE id = ?').get(visit.id),
-    summary: { done, skipped, pending, total: tasks.length },
+    summary,
   });
 });
 
@@ -1015,6 +1182,23 @@ app.get('/homes/:homeId/feedback', authRequired, (req, res) => {
        LIMIT 50`
     )
     .all(req.params.homeId);
+
+  if (role === 'cleaner') {
+    return res.json({
+      feedback: feedback.map((f) => ({
+        id: f.id,
+        visit_id: f.visit_id,
+        home_id: f.home_id,
+        author_id: f.author_id,
+        went_well: f.went_well,
+        needs_improvement: '',
+        created_at: f.created_at,
+        author_name: f.author_name,
+        visit_date: f.visit_date,
+      })),
+    });
+  }
+
   res.json({ feedback });
 });
 

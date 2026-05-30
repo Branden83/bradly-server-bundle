@@ -167,4 +167,39 @@ function migrateSubscriptionTrialAndVisitResponse() {
 
 migrateSubscriptionTrialAndVisitResponse();
 
+function migrateUxPriorities45678() {
+  const done = db.prepare('SELECT 1 FROM _migrations WHERE name = ?').get('ux_priorities_45678_v1');
+  if (done) return;
+
+  const visitCols = db.prepare('PRAGMA table_info(visits)').all();
+  if (!visitCols.some((c) => c.name === 'decline_reason')) {
+    db.exec(`ALTER TABLE visits ADD COLUMN decline_reason TEXT`);
+  }
+  if (!visitCols.some((c) => c.name === 'decline_reason_text')) {
+    db.exec(`ALTER TABLE visits ADD COLUMN decline_reason_text TEXT`);
+  }
+
+  const taskCols = db.prepare('PRAGMA table_info(task_templates)').all();
+  if (!taskCols.some((c) => c.name === 'priority')) {
+    db.exec(`ALTER TABLE task_templates ADD COLUMN priority TEXT NOT NULL DEFAULT 'must'`);
+  }
+
+  const vtCols = db.prepare('PRAGMA table_info(visit_tasks)').all();
+  if (!vtCols.some((c) => c.name === 'priority')) {
+    db.exec(`ALTER TABLE visit_tasks ADD COLUMN priority TEXT NOT NULL DEFAULT 'must'`);
+  }
+
+  db.exec(`
+    UPDATE visit_tasks SET priority = COALESCE(
+      (SELECT priority FROM task_templates WHERE id = visit_tasks.task_template_id),
+      'must'
+    )
+    WHERE task_template_id IS NOT NULL
+  `);
+
+  db.prepare(`INSERT INTO _migrations (name) VALUES (?)`).run('ux_priorities_45678_v1');
+}
+
+migrateUxPriorities45678();
+
 export default db;
