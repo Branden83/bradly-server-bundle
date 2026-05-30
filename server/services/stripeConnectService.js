@@ -1,5 +1,8 @@
 import { v4 as uuid } from 'uuid';
 import db from '../db.js';
+import { getStripeClient } from '../lib/stripeClient.js';
+import { isStripeConfigured as stripeKeysConfigured } from '../lib/stripeConfig.js';
+import { rethrowStripeError } from '../lib/stripeErrors.js';
 import { assertFound, ServiceError } from '../lib/serviceError.js';
 import { validateStripeOnboardingStatus } from '../validation/cleanerProfile.js';
 import { assertCleanerUser, getProfileRowByUserId } from './cleanerProfileHelpers.js';
@@ -27,7 +30,7 @@ function updateProfileStripeStatus(userId, status) {
 
 /**
  * Map Stripe account capabilities to profile onboarding status.
- * @param {{ charges_enabled?: boolean, payouts_enabled?: boolean, requirements?: { disabled_reason?: string } }} account
+ * @param {{ charges_enabled?: boolean, payouts_enabled?: boolean, requirements?: { disabled_reason?: string | null } }} account
  */
 export function mapStripeAccountToOnboardingStatus(account) {
   if (account.requirements?.disabled_reason) return 'restricted';
@@ -43,8 +46,6 @@ export function isStripeOnboardingComplete(cleanerId) {
 }
 
 /**
- * MVP stub: Stripe Connect onboarding required before cleaner can receive in-app payments.
- *
  * @param {string} cleanerId
  * @returns {{ ready: boolean, reason?: string, stripe_onboarding_status: string, account_id?: string | null }}
  */
@@ -57,7 +58,7 @@ export function getCleanerConnectStatus(cleanerId) {
   const profile = getProfileRowByUserId(cleanerId);
   const profileStatus = profile?.stripe_onboarding_status ?? 'not_started';
 
-  if (DEV_BYPASS) {
+  if (DEV_BYPASS && !stripeKeysConfigured()) {
     return {
       ready: true,
       reason: 'dev_bypass',
@@ -92,7 +93,45 @@ export function getCleanerConnectStatus(cleanerId) {
 }
 
 export function isStripeConfigured() {
-  return Boolean(process.env.STRIPE_SECRET_KEY);
+  return stripeKeysConfigured();
+}
+
+/**
+ * Persist Connect account state from a Stripe Account object.
+ * @param {string} userId
+ * @param {import('stripe').Stripe.Account} account
+ */
+export function syncConnectStatusFromStripeAccount(userId, account) {
+  const nextStatus = mapStripeAccountToOnboardingStatus(account);
+  const onboardingComplete = nextStatus === 'complete';
+  return syncConnectStatus(userId, { onboardingComplete, status: nextStatus });
+}
+
+/**
+ * Fetch live account from Stripe and sync local state.
+ * @param {string} userId
+ */
+export async function refreshConnectStatusFromStripe(userId) {
+  assertCleanerUser(userId);
+  const user = getUserStripeRow(userId);
+  assertFound(user, 'User not found');
+
+  if (!user.stripe_connect_account_id) {
+    return getCleanerConnectStatus(userId);
+  }
+
+  const stripe = getStripeClient();
+  if (!stripe) {
+    return getCleanerConnectStatus(userId);
+  }
+
+  try {
+    const account = await stripe.accounts.retrieve(user.stripe_connect_account_id);
+    syncConnectStatusFromStripeAccount(userId, account);
+    return getCleanerConnectStatus(userId);
+  } catch (err) {
+    rethrowStripeError(err);
+  }
 }
 
 /**
@@ -100,7 +139,7 @@ export function isStripeConfigured() {
  * @param {string} userId
  * @param {{ email?: string, country?: string }} [options]
  */
-export function createConnectAccount(userId, options = {}) {
+export async function createConnectAccount(userId, options = {}) {
   assertCleanerUser(userId);
   const profile = getProfileRowByUserId(userId);
   assertFound(profile, 'Create a cleaner profile before connecting payments');
@@ -117,14 +156,28 @@ export function createConnectAccount(userId, options = {}) {
   }
 
   let accountId;
-  if (isStripeConfigured()) {
-    throw new ServiceError(
-      'Stripe SDK wiring pending — set STRIPE_SECRET_KEY and implement account creation',
-      { status: 501, code: 'stripe_not_implemented' }
-    );
+  const stripe = getStripeClient();
+
+  if (stripe) {
+    try {
+      const account = await stripe.accounts.create({
+        type: 'express',
+        country: options.country || 'US',
+        email: options.email ?? user.email,
+        capabilities: {
+          card_payments: { requested: true },
+          transfers: { requested: true },
+        },
+        metadata: { bradley_user_id: userId },
+      });
+      accountId = account.id;
+    } catch (err) {
+      rethrowStripeError(err);
+    }
+  } else {
+    accountId = `acct_dev_${uuid().replace(/-/g, '').slice(0, 16)}`;
   }
 
-  accountId = `acct_dev_${uuid().replace(/-/g, '').slice(0, 16)}`;
   db.prepare(
     `UPDATE users SET stripe_connect_account_id = ?, stripe_connect_onboarding_complete = 0
      WHERE id = ?`
@@ -135,7 +188,7 @@ export function createConnectAccount(userId, options = {}) {
     account_id: accountId,
     stripe_onboarding_status: 'pending',
     already_exists: false,
-    dev_mode: !isStripeConfigured(),
+    dev_mode: !stripe,
     email: options.email ?? user.email,
   };
 }
@@ -144,7 +197,7 @@ export function createConnectAccount(userId, options = {}) {
  * @param {string} userId
  * @param {{ returnUrl: string, refreshUrl: string }} urls
  */
-export function createOnboardingLink(userId, { returnUrl, refreshUrl }) {
+export async function createOnboardingLink(userId, { returnUrl, refreshUrl }) {
   assertCleanerUser(userId);
   const user = getUserStripeRow(userId);
   assertFound(user, 'User not found');
@@ -157,11 +210,24 @@ export function createOnboardingLink(userId, { returnUrl, refreshUrl }) {
     throw new ServiceError('returnUrl and refreshUrl are required');
   }
 
-  if (isStripeConfigured()) {
-    throw new ServiceError(
-      'Stripe SDK wiring pending — set STRIPE_SECRET_KEY and implement account links',
-      { status: 501, code: 'stripe_not_implemented' }
-    );
+  const stripe = getStripeClient();
+
+  if (stripe) {
+    try {
+      const accountLink = await stripe.accountLinks.create({
+        account: user.stripe_connect_account_id,
+        refresh_url: refreshUrl,
+        return_url: returnUrl,
+        type: 'account_onboarding',
+      });
+      return {
+        url: accountLink.url,
+        expires_at: accountLink.expires_at,
+        dev_mode: false,
+      };
+    } catch (err) {
+      rethrowStripeError(err);
+    }
   }
 
   if (DEV_BYPASS) {
@@ -193,7 +259,7 @@ export function syncConnectStatus(userId, stripeState = {}) {
 
   let nextStatus = stripeState.status;
   if (!nextStatus) {
-    if (DEV_BYPASS && stripeState.onboardingComplete !== false) {
+    if (DEV_BYPASS && !stripeKeysConfigured() && stripeState.onboardingComplete !== false) {
       nextStatus = 'complete';
     } else if (user.stripe_connect_onboarding_complete) {
       nextStatus = 'complete';
@@ -208,7 +274,8 @@ export function syncConnectStatus(userId, stripeState = {}) {
 
   const onboardingComplete =
     stripeState.onboardingComplete ??
-    (nextStatus === 'complete' || (DEV_BYPASS && nextStatus !== 'restricted'));
+    (nextStatus === 'complete' ||
+      (DEV_BYPASS && !stripeKeysConfigured() && nextStatus !== 'restricted'));
 
   db.prepare(
     `UPDATE users SET stripe_connect_onboarding_complete = ? WHERE id = ?`
@@ -222,12 +289,18 @@ export function syncConnectStatus(userId, stripeState = {}) {
 /**
  * @param {string} userId
  */
-export function getConnectAccountStatus(userId) {
+export async function getConnectAccountStatus(userId) {
   assertCleanerUser(userId);
+
+  if (isStripeConfigured()) {
+    await refreshConnectStatusFromStripe(userId);
+  }
+
   const status = getCleanerConnectStatus(userId);
   const profile = getProfileRowByUserId(userId);
   return {
     ...status,
     stripe_onboarding_status: profile?.stripe_onboarding_status ?? status.stripe_onboarding_status,
+    stripe_configured: isStripeConfigured(),
   };
 }

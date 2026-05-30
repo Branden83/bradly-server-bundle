@@ -12,6 +12,7 @@ function handleServiceError(err, res) {
   if (err instanceof ServiceError) {
     const payload = { error: err.message };
     if (err.code) payload.code = err.code;
+    if (err.details) payload.details = err.details;
     return res.status(err.status).json(payload);
   }
   console.error('[cleanerProfile]', err);
@@ -20,11 +21,9 @@ function handleServiceError(err, res) {
 
 function wrap(handler) {
   return (req, res) => {
-    try {
-      handler(req, res);
-    } catch (err) {
-      handleServiceError(err, res);
-    }
+    Promise.resolve()
+      .then(() => handler(req, res))
+      .catch((err) => handleServiceError(err, res));
   };
 }
 
@@ -244,9 +243,9 @@ export function registerCleanerProfileRoutes(app, { auth, authRequired, requireA
   app.post(
     '/payments/connect/account',
     auth,
-    wrap((req, res) => {
+    wrap(async (req, res) => {
       if (!requireCleaner(req, res)) return;
-      const account = stripeConnectService.createConnectAccount(req.user.id, req.body);
+      const account = await stripeConnectService.createConnectAccount(req.user.id, req.body);
       res.status(account.already_exists ? 200 : 201).json(account);
     })
   );
@@ -254,9 +253,9 @@ export function registerCleanerProfileRoutes(app, { auth, authRequired, requireA
   app.post(
     '/payments/connect/onboarding-link',
     auth,
-    wrap((req, res) => {
+    wrap(async (req, res) => {
       if (!requireCleaner(req, res)) return;
-      const link = stripeConnectService.createOnboardingLink(req.user.id, {
+      const link = await stripeConnectService.createOnboardingLink(req.user.id, {
         returnUrl: req.body.returnUrl ?? req.body.return_url,
         refreshUrl: req.body.refreshUrl ?? req.body.refresh_url,
       });
@@ -267,9 +266,9 @@ export function registerCleanerProfileRoutes(app, { auth, authRequired, requireA
   app.get(
     '/payments/connect/status',
     auth,
-    wrap((req, res) => {
+    wrap(async (req, res) => {
       if (!requireCleaner(req, res)) return;
-      res.json(stripeConnectService.getConnectAccountStatus(req.user.id));
+      res.json(await stripeConnectService.getConnectAccountStatus(req.user.id));
     })
   );
 

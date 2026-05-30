@@ -7,11 +7,12 @@ export class ServiceError extends Error {
    * @param {string} message
    * @param {{ status?: number, code?: string }} [options]
    */
-  constructor(message, { status = 400, code } = {}) {
+  constructor(message, { status = 400, code, details } = {}) {
     super(message);
     this.name = 'ServiceError';
     this.status = status;
     this.code = code;
+    this.details = details;
   }
 }
 
