@@ -541,6 +541,81 @@ function migrateCleanerProfileV2() {
 
 migrateCleanerProfileV2();
 
+function migrateVisitTasksTimingV1() {
+  const done = db.prepare('SELECT 1 FROM _migrations WHERE name = ?').get('visit_tasks_timing_v1');
+  if (done) return;
+
+  const vtCols = db.prepare('PRAGMA table_info(visit_tasks)').all();
+  if (!vtCols.some((c) => c.name === 'started_at')) {
+    db.exec(`ALTER TABLE visit_tasks ADD COLUMN started_at TEXT`);
+  }
+  if (!vtCols.some((c) => c.name === 'actual_minutes')) {
+    db.exec(`ALTER TABLE visit_tasks ADD COLUMN actual_minutes INTEGER`);
+  }
+
+  const tableInfo = db
+    .prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='visit_tasks'`)
+    .get();
+  if (tableInfo?.sql && !tableInfo.sql.includes('in_progress')) {
+    db.exec('PRAGMA foreign_keys = OFF');
+    db.exec(`
+      CREATE TABLE visit_tasks_timing_v1 (
+        id TEXT PRIMARY KEY,
+        visit_id TEXT NOT NULL REFERENCES visits(id) ON DELETE CASCADE,
+        task_template_id TEXT REFERENCES task_templates(id) ON DELETE SET NULL,
+        room_name TEXT NOT NULL,
+        title TEXT NOT NULL,
+        instructions TEXT NOT NULL DEFAULT '',
+        cadence TEXT NOT NULL,
+        priority TEXT NOT NULL DEFAULT 'must' CHECK (priority IN ('must', 'nice', 'skip_visit')),
+        status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'in_progress', 'done', 'skipped', 'blocked')),
+        skip_reason TEXT,
+        started_at TEXT,
+        completed_at TEXT,
+        actual_minutes INTEGER
+      );
+      INSERT INTO visit_tasks_timing_v1 (
+        id, visit_id, task_template_id, room_name, title, instructions, cadence, priority,
+        status, skip_reason, started_at, completed_at, actual_minutes
+      )
+      SELECT
+        id, visit_id, task_template_id, room_name, title, instructions, cadence, priority,
+        status, skip_reason, started_at, completed_at, actual_minutes
+      FROM visit_tasks;
+      DROP TABLE visit_tasks;
+      ALTER TABLE visit_tasks_timing_v1 RENAME TO visit_tasks;
+      CREATE INDEX IF NOT EXISTS idx_visit_tasks_visit ON visit_tasks(visit_id);
+    `);
+    db.exec('PRAGMA foreign_keys = ON');
+  }
+
+  const sql = readFileSync(join(__dirname, 'migrations', '004_visit_tasks_timing_v1.sql'), 'utf8');
+  db.exec(sql);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS task_estimate_suggestions (
+      id TEXT PRIMARY KEY,
+      home_id TEXT NOT NULL REFERENCES homes(id) ON DELETE CASCADE,
+      task_template_id TEXT NOT NULL REFERENCES task_templates(id) ON DELETE CASCADE,
+      current_minutes INTEGER NOT NULL,
+      suggested_minutes INTEGER NOT NULL,
+      sample_count INTEGER NOT NULL DEFAULT 0,
+      divergence_percent REAL,
+      ai_summary TEXT,
+      ai_summary_cached_at TEXT,
+      status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'applied', 'dismissed')),
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      applied_at TEXT,
+      UNIQUE(home_id, task_template_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_task_estimate_suggestions_home ON task_estimate_suggestions(home_id, status);
+  `);
+
+  db.prepare(`INSERT INTO _migrations (name) VALUES (?)`).run('visit_tasks_timing_v1');
+}
+
+migrateVisitTasksTimingV1();
+
 function boolToInt(value, defaultValue = 0) {
   if (value === undefined || value === null) return defaultValue;
   return value ? 1 : 0;
@@ -1581,5 +1656,25 @@ export function createPlatformFee({
   );
   return db.prepare('SELECT * FROM platform_fees WHERE id = ?').get(id);
 }
+
+function migrateEstimateLearningAiV1() {
+  const done = db.prepare('SELECT 1 FROM _migrations WHERE name = ?').get('estimate_learning_ai_v1');
+  if (done) return;
+
+  const sugCols = db.prepare('PRAGMA table_info(task_estimate_suggestions)').all();
+  if (sugCols.length && !sugCols.some((c) => c.name === 'ai_summary')) {
+    db.exec(`ALTER TABLE task_estimate_suggestions ADD COLUMN ai_summary TEXT`);
+  }
+  if (sugCols.length && !sugCols.some((c) => c.name === 'ai_summary_cached_at')) {
+    db.exec(`ALTER TABLE task_estimate_suggestions ADD COLUMN ai_summary_cached_at TEXT`);
+  }
+  if (sugCols.length && !sugCols.some((c) => c.name === 'divergence_percent')) {
+    db.exec(`ALTER TABLE task_estimate_suggestions ADD COLUMN divergence_percent REAL`);
+  }
+
+  db.prepare(`INSERT INTO _migrations (name) VALUES (?)`).run('estimate_learning_ai_v1');
+}
+
+migrateEstimateLearningAiV1();
 
 export default db;

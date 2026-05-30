@@ -6,6 +6,14 @@ import { networkInterfaces } from 'os';
 import { v4 as uuid } from 'uuid';
 import { getCleanerReminders } from './ai/reminders.js';
 import db from './db.js';
+import {
+  applyEstimateSuggestion,
+  formatEstimateSuggestion,
+  inferActualMinutesForVisit,
+  listPendingEstimateSuggestions,
+  processVisitCompletion,
+  refreshAiSummariesForHome,
+} from './services/estimateLearningService.js';
 import { registerCleanerProfileRoutes } from './routes/cleanerProfile.js';
 import { registerMarketplaceRoutes } from './routes/marketplace.js';
 import {
@@ -17,6 +25,14 @@ import {
   markInvoicePaidFromPayment,
 } from './services/invoiceService.js';
 import { getCleanerConnectStatus, isStripeConfigured } from './services/stripeConnectService.js';
+import {
+  completeTask,
+  getVisitTaskContext,
+  skipTask,
+  startTask,
+  updateVisitTaskStatus,
+} from './services/taskTimingService.js';
+import { ServiceError } from './lib/serviceError.js';
 
 const app = express();
 const PORT = Number(process.env.PORT || 3847);
@@ -462,6 +478,43 @@ function computeVisitEstimates(visitId, hourlyRateCents) {
   return { totalEstimatedMinutes, estimatedCostCents, hourlyRateCents: rate };
 }
 
+function enrichVisitTask(task) {
+  const estimated = task.task_template_id
+    ? db.prepare('SELECT estimated_minutes FROM task_templates WHERE id = ?').get(task.task_template_id)
+    : null;
+  return {
+    ...task,
+    estimated_minutes: estimated?.estimated_minutes ?? 15,
+  };
+}
+
+function handleServiceError(err, res) {
+  if (err instanceof ServiceError) {
+    return res.status(err.status).json({ error: err.message });
+  }
+  console.error('[api]', err);
+  return res.status(500).json({ error: 'Something went wrong' });
+}
+
+function assertVisitHouseholdMember(userId, homeId) {
+  if (!getUserHomeRole(userId, homeId)) {
+    throw new ServiceError('Not a member of this visit\'s household', { status: 403 });
+  }
+}
+
+function loadVisitTaskForRoute(visitId, taskId) {
+  const visit = db.prepare('SELECT * FROM visits WHERE id = ?').get(visitId);
+  if (!visit) throw new ServiceError('Visit not found', { status: 404 });
+
+  const vt = getVisitTaskContext(taskId);
+  if (!vt) throw new ServiceError('Task not found', { status: 404 });
+  if (vt.visit_id !== visitId) {
+    throw new ServiceError('Task does not belong to this visit', { status: 400 });
+  }
+
+  return { visit, vt };
+}
+
 function buildVisitSummary(visitId, homeId, userId, userRole) {
   const home = db.prepare('SELECT hourly_rate_cents FROM homes WHERE id = ?').get(homeId);
   const estimates = computeVisitEstimates(visitId, home?.hourly_rate_cents);
@@ -479,6 +532,7 @@ function buildVisitSummary(visitId, homeId, userId, userRole) {
   const done = tasks.filter((t) => t.status === 'done');
   const skipped = tasks.filter((t) => t.status === 'skipped');
   const pending = tasks.filter((t) => t.status === 'pending');
+  const inProgress = tasks.filter((t) => t.status === 'in_progress');
   const blocked = tasks.filter((t) => t.status === 'blocked');
 
   const feedbackRow = db
@@ -504,6 +558,7 @@ function buildVisitSummary(visitId, homeId, userId, userRole) {
     done: done.length,
     skipped: skipped.length,
     pending: pending.length,
+    inProgress: inProgress.length,
     blocked: blocked.length,
     total: tasks.length,
     questionsCount,
@@ -524,6 +579,7 @@ function buildVisitSummary(visitId, homeId, userId, userRole) {
     })),
     feedbackSubmitted: !!feedbackRow,
     invoice: invoiceRow ? { id: invoiceRow.id, status: invoiceRow.status } : null,
+    estimateSuggestions: listPendingEstimateSuggestions(homeId),
   };
 }
 
@@ -874,6 +930,72 @@ app.patch('/tasks/:id', authRequired, (req, res) => {
   res.json(db.prepare('SELECT * FROM task_templates WHERE id = ?').get(task.id));
 });
 
+// ─── Estimate learning suggestions ───────────────────────────────────────────
+
+app.get('/homes/:homeId/estimate-suggestions', authRequired, (req, res) => {
+  const home = db.prepare('SELECT id FROM homes WHERE id = ?').get(req.params.homeId);
+  if (!home) return res.status(404).json({ error: 'Not found' });
+  if (!getUserHomeRole(req.user.id, home.id) && !isAdminUser(req.user)) {
+    return res.status(403).json({ error: 'Not allowed' });
+  }
+  res.json(listPendingEstimateSuggestions(home.id));
+});
+
+app.post('/estimate-suggestions/:id/apply', authRequired, (req, res) => {
+  const suggestion = db
+    .prepare('SELECT * FROM task_estimate_suggestions WHERE id = ?')
+    .get(req.params.id);
+  if (!suggestion) return res.status(404).json({ error: 'Not found' });
+  if (!canManageHome(req.user.id, suggestion.home_id) && !isAdminUser(req.user)) {
+    return res.status(403).json({ error: 'Not allowed' });
+  }
+
+  const result = applyEstimateSuggestion(db, suggestion.id);
+  if (result?.error) return res.status(400).json({ error: result.error });
+  res.json(formatEstimateSuggestion(result));
+});
+
+app.post('/estimate-suggestions/:id/dismiss', authRequired, (req, res) => {
+  const suggestion = db
+    .prepare('SELECT * FROM task_estimate_suggestions WHERE id = ?')
+    .get(req.params.id);
+  if (!suggestion) return res.status(404).json({ error: 'Not found' });
+  if (!canManageHome(req.user.id, suggestion.home_id) && !isAdminUser(req.user)) {
+    return res.status(403).json({ error: 'Not allowed' });
+  }
+
+  db.prepare(
+    `UPDATE task_estimate_suggestions SET status = 'dismissed' WHERE id = ?`
+  ).run(suggestion.id);
+
+  const row = db
+    .prepare(
+      `SELECT s.*, tt.title, r.name AS room_name, h.name AS home_name
+       FROM task_estimate_suggestions s
+       JOIN task_templates tt ON tt.id = s.task_template_id
+       JOIN rooms r ON r.id = tt.room_id
+       JOIN homes h ON h.id = s.home_id
+       WHERE s.id = ?`
+    )
+    .get(suggestion.id);
+  res.json(formatEstimateSuggestion(row));
+});
+
+app.get('/admin/estimate-suggestions', authRequired, requireAdmin, (_req, res) => {
+  const rows = db
+    .prepare(
+      `SELECT s.*, tt.title, r.name AS room_name, h.name AS home_name
+       FROM task_estimate_suggestions s
+       JOIN task_templates tt ON tt.id = s.task_template_id
+       JOIN rooms r ON r.id = tt.room_id
+       JOIN homes h ON h.id = s.home_id
+       WHERE s.status = 'pending'
+       ORDER BY s.created_at DESC`
+    )
+    .all();
+  res.json(rows.map(formatEstimateSuggestion));
+});
+
 // ─── Visits ─────────────────────────────────────────────────────────────────
 
 app.get('/visits/upcoming', authRequired, async (req, res) => {
@@ -894,7 +1016,7 @@ app.get('/visits/upcoming', authRequired, async (req, res) => {
          WHERE q.visit_task_id = ? ORDER BY q.created_at`
       )
       .all(t.id);
-    return { ...t, questions };
+    return enrichVisitTask({ ...t, questions });
   });
 
   const payload = {
@@ -954,7 +1076,7 @@ app.get('/visits/:id', authRequired, (req, res) => {
          WHERE q.visit_task_id = ? ORDER BY q.created_at`
       )
       .all(t.id);
-    return { ...t, questions };
+    return enrichVisitTask({ ...t, questions });
   });
   res.json({
     visit: {
@@ -1063,35 +1185,62 @@ app.post('/visits/:id/start', authRequired, (req, res) => {
   res.json(db.prepare('SELECT * FROM visits WHERE id = ?').get(visit.id));
 });
 
-app.patch('/visit-tasks/:id', authRequired, (req, res) => {
-  const vt = db
-    .prepare(
-      `SELECT vt.*, v.home_id, v.id as visit_id, v.status as visit_status
-       FROM visit_tasks vt JOIN visits v ON v.id = vt.visit_id
-       WHERE vt.id = ?`
-    )
-    .get(req.params.id);
-  if (!vt) return res.status(404).json({ error: 'Not found' });
-
-  const { status, skipReason } = req.body;
-  if (!['pending', 'done', 'skipped', 'blocked'].includes(status)) {
-    return res.status(400).json({ error: 'Invalid status' });
+app.post('/visits/:visitId/tasks/:taskId/start', authRequired, (req, res) => {
+  try {
+    const { visit } = loadVisitTaskForRoute(req.params.visitId, req.params.taskId);
+    assertVisitHouseholdMember(req.user.id, visit.home_id);
+    const updated = startTask(req.params.taskId, req.user.id);
+    res.json(enrichVisitTask(updated));
+  } catch (err) {
+    return handleServiceError(err, res);
   }
-
-  db.prepare(
-    `UPDATE visit_tasks SET status = ?, skip_reason = ?, completed_at = CASE WHEN ? IN ('done','skipped') THEN datetime('now') ELSE NULL END WHERE id = ?`
-  ).run(status, skipReason || null, status, vt.id);
-
-  if (status === 'done' && vt.task_template_id) {
-    db.prepare('UPDATE task_templates SET last_completed_at = datetime(\'now\') WHERE id = ?').run(
-      vt.task_template_id
-    );
-  }
-
-  res.json(db.prepare('SELECT * FROM visit_tasks WHERE id = ?').get(vt.id));
 });
 
-app.post('/visits/:id/complete', authRequired, (req, res) => {
+app.post('/visits/:visitId/tasks/:taskId/complete', authRequired, (req, res) => {
+  try {
+    const { visit } = loadVisitTaskForRoute(req.params.visitId, req.params.taskId);
+    assertVisitHouseholdMember(req.user.id, visit.home_id);
+    const updated = completeTask(req.params.taskId, req.user.id);
+    res.json(enrichVisitTask(updated));
+  } catch (err) {
+    return handleServiceError(err, res);
+  }
+});
+
+app.post('/visit-tasks/:id/start', authRequired, (req, res) => {
+  try {
+    const updated = startTask(req.params.id, req.user.id);
+    res.json(enrichVisitTask(updated));
+  } catch (err) {
+    return handleServiceError(err, res);
+  }
+});
+
+app.post('/visit-tasks/:id/complete', authRequired, (req, res) => {
+  try {
+    const updated = completeTask(req.params.id, req.user.id);
+    res.json(enrichVisitTask(updated));
+  } catch (err) {
+    return handleServiceError(err, res);
+  }
+});
+
+app.patch('/visit-tasks/:id', authRequired, (req, res) => {
+  try {
+    const { status, skipReason } = req.body;
+    const updated = updateVisitTaskStatus(req.params.id, {
+      status,
+      skipReason,
+      userId: req.user.id,
+      userRole: req.user.role,
+    });
+    res.json(enrichVisitTask(updated));
+  } catch (err) {
+    return handleServiceError(err, res);
+  }
+});
+
+app.post('/visits/:id/complete', authRequired, async (req, res) => {
   const visit = db.prepare('SELECT * FROM visits WHERE id = ?').get(req.params.id);
   if (!visit) return res.status(404).json({ error: 'Not found' });
 
@@ -1099,10 +1248,19 @@ app.post('/visits/:id/complete', authRequired, (req, res) => {
     `UPDATE visits SET status = 'completed', completed_at = datetime('now') WHERE id = ?`
   ).run(visit.id);
 
+  inferActualMinutesForVisit(db, visit.id);
+
+  try {
+    processVisitCompletion(visit.id, visit.home_id, db);
+    await refreshAiSummariesForHome(visit.home_id, getSetting, db);
+  } catch (err) {
+    console.error('[visits/complete] estimate learning failed:', err.message);
+  }
+
   const tasks = db.prepare('SELECT status FROM visit_tasks WHERE visit_id = ?').all(visit.id);
   const done = tasks.filter((t) => t.status === 'done').length;
   const skipped = tasks.filter((t) => t.status === 'skipped').length;
-  const pending = tasks.filter((t) => t.status === 'pending').length;
+  const pending = tasks.filter((t) => t.status === 'pending' || t.status === 'in_progress').length;
 
   const summary = buildVisitSummary(visit.id, visit.home_id, req.user.id, req.user.role);
 

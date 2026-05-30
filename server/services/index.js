@@ -12,3 +12,7 @@ export * as agreementService from './agreementService.js';
 export * as paymentFeeService from './paymentFeeService.js';
 export * as invoiceService from './invoiceService.js';
 export * as stripeConnectService from './stripeConnectService.js';
+export * as taskTimingService from './taskTimingService.js';
+export * as estimateLearningService from './estimateLearningService.js';
+export * as taskTimingService from './taskTimingService.js';
+export * as estimateLearningService from './estimateLearningService.js';
