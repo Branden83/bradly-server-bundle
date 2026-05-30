@@ -1,3 +1,4 @@
-:80 {
+# HTTPS-only firewall (https-server tag) — plain HTTP on 443 until we have a domain + TLS cert
+:443 {
 	reverse_proxy 127.0.0.1:3847
 }

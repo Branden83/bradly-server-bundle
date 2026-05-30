@@ -44,4 +44,4 @@ cp /opt/bradly/deploy/Caddyfile /etc/caddy/Caddyfile
 systemctl enable caddy
 systemctl restart caddy
 
-curl -sf http://127.0.0.1/health && echo " bradly-api ready"
+curl -sf http://127.0.0.1:443/health && echo " bradly-api ready"
