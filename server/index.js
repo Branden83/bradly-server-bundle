@@ -306,6 +306,7 @@ app.post('/auth/register', (req, res) => {
     token,
     user: { id, email: email.toLowerCase(), displayName, role, isAdmin: isAdminUser({ id }) },
   });
+});
 
 app.post('/auth/login', (req, res) => {
   const { email, password } = req.body;
