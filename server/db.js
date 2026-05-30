@@ -2,6 +2,7 @@ import Database from 'better-sqlite3';
 import { readFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
+import { calculatePaymentBreakdown } from './services/paymentFeeService.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const dbPath = process.env.BRADLEY_DB_PATH || join(__dirname, 'bradley.db');
@@ -212,6 +213,188 @@ function migrateMarketplaceV1() {
 }
 
 migrateMarketplaceV1();
+
+function migratePaymentsV1() {
+  const done = db.prepare('SELECT 1 FROM _migrations WHERE name = ?').get('payments_v1');
+  if (done) return;
+
+  const userCols = db.prepare('PRAGMA table_info(users)').all();
+  if (!userCols.some((c) => c.name === 'stripe_connect_account_id')) {
+    db.exec(`ALTER TABLE users ADD COLUMN stripe_connect_account_id TEXT`);
+  }
+  if (!userCols.some((c) => c.name === 'stripe_connect_onboarding_complete')) {
+    db.exec(`ALTER TABLE users ADD COLUMN stripe_connect_onboarding_complete INTEGER NOT NULL DEFAULT 0`);
+  }
+
+  const agreementCols = db.prepare('PRAGMA table_info(household_cleaner_agreements)').all();
+  if (!agreementCols.some((c) => c.name === 'fee_type')) {
+    db.exec(`ALTER TABLE household_cleaner_agreements ADD COLUMN fee_type TEXT`);
+  }
+  if (!agreementCols.some((c) => c.name === 'fee_percent')) {
+    db.exec(`ALTER TABLE household_cleaner_agreements ADD COLUMN fee_percent INTEGER`);
+  }
+
+  db.exec(`
+    UPDATE household_cleaner_agreements
+    SET fee_type = CASE WHEN source = 'match' THEN 'match_fee' ELSE 'byoc_platform_fee' END,
+        fee_percent = CASE WHEN source = 'match' THEN 10 ELSE 5 END
+    WHERE fee_type IS NULL OR fee_percent IS NULL
+  `);
+
+  const invoiceCols = db.prepare('PRAGMA table_info(invoices)').all();
+  const addInvoiceCol = (name, ddl) => {
+    if (!invoiceCols.some((c) => c.name === name)) {
+      db.exec(`ALTER TABLE invoices ADD COLUMN ${ddl}`);
+    }
+  };
+  addInvoiceCol('cleaner_amount_cents', 'cleaner_amount_cents INTEGER');
+  addInvoiceCol('bradley_fee_cents', 'bradley_fee_cents INTEGER');
+  addInvoiceCol('total_amount_cents', 'total_amount_cents INTEGER');
+  addInvoiceCol('fee_type', 'fee_type TEXT');
+  addInvoiceCol('fee_percent', 'fee_percent INTEGER');
+  addInvoiceCol('agreement_id', 'agreement_id TEXT REFERENCES household_cleaner_agreements(id) ON DELETE SET NULL');
+  addInvoiceCol('payment_intent_id', 'payment_intent_id TEXT');
+
+  const invoiceBackfill = db
+    .prepare(
+      `SELECT id, home_id, cleaner_id, amount_cents FROM invoices WHERE cleaner_amount_cents IS NULL`
+    )
+    .all();
+  const agreementForBackfill = db.prepare(
+    `SELECT id, source FROM household_cleaner_agreements
+     WHERE household_id = ? AND cleaner_id = ? AND status = 'active'
+     ORDER BY created_at DESC LIMIT 1`
+  );
+  const invoiceBreakdownUpdate = db.prepare(
+    `UPDATE invoices SET
+      agreement_id = ?, cleaner_amount_cents = ?, bradley_fee_cents = ?,
+      total_amount_cents = ?, fee_type = ?, fee_percent = ?
+     WHERE id = ?`
+  );
+  for (const inv of invoiceBackfill) {
+    const agreement = agreementForBackfill.get(inv.home_id, inv.cleaner_id);
+    const source = agreement?.source === 'match' ? 'match' : 'byoc';
+    const breakdown = calculatePaymentBreakdown({
+      cleanerAmountCents: inv.amount_cents,
+      source,
+    });
+    invoiceBreakdownUpdate.run(
+      agreement?.id ?? null,
+      breakdown.cleaner_amount_cents,
+      breakdown.bradley_fee_cents,
+      breakdown.total_amount_cents,
+      breakdown.fee_type,
+      breakdown.fee_percent,
+      inv.id
+    );
+  }
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS payment_intents (
+      id TEXT PRIMARY KEY,
+      stripe_payment_intent_id TEXT UNIQUE,
+      invoice_id TEXT REFERENCES invoices(id) ON DELETE SET NULL,
+      agreement_id TEXT REFERENCES household_cleaner_agreements(id) ON DELETE SET NULL,
+      homeowner_id TEXT NOT NULL REFERENCES users(id),
+      cleaner_id TEXT NOT NULL REFERENCES users(id),
+      cleaner_amount_cents INTEGER NOT NULL,
+      bradley_fee_cents INTEGER NOT NULL,
+      total_amount_cents INTEGER NOT NULL,
+      fee_type TEXT NOT NULL CHECK (fee_type IN ('byoc_platform_fee', 'match_fee')),
+      fee_percent INTEGER NOT NULL,
+      currency TEXT NOT NULL DEFAULT 'usd',
+      status TEXT NOT NULL DEFAULT 'requires_payment_method',
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_payment_intents_invoice ON payment_intents(invoice_id);
+    CREATE INDEX IF NOT EXISTS idx_payment_intents_stripe ON payment_intents(stripe_payment_intent_id);
+  `);
+
+  db.prepare(`INSERT INTO _migrations (name) VALUES (?)`).run('payments_v1');
+}
+
+migratePaymentsV1();
+
+function migratePaymentMonetizationV1() {
+  const done = db.prepare('SELECT 1 FROM _migrations WHERE name = ?').get('payment_monetization_v1');
+  if (done) return;
+
+  const hasPlatformFees = db
+    .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='platform_fees'")
+    .get();
+  if (!hasPlatformFees) {
+    db.exec(`
+      CREATE TABLE platform_fees (
+        id TEXT PRIMARY KEY,
+        payment_intent_id TEXT REFERENCES payment_intents(id) ON DELETE SET NULL,
+        invoice_id TEXT REFERENCES invoices(id) ON DELETE SET NULL,
+        agreement_id TEXT REFERENCES household_cleaner_agreements(id) ON DELETE SET NULL,
+        fee_type TEXT NOT NULL CHECK (fee_type IN ('byoc_platform_fee', 'match_fee')),
+        fee_percent INTEGER NOT NULL CHECK (fee_percent IN (5, 10)),
+        cleaner_amount_cents INTEGER NOT NULL,
+        fee_amount_cents INTEGER NOT NULL,
+        total_amount_cents INTEGER NOT NULL,
+        stripe_fee_id TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_platform_fees_payment_intent ON platform_fees(payment_intent_id);
+      CREATE INDEX IF NOT EXISTS idx_platform_fees_invoice ON platform_fees(invoice_id);
+    `);
+  }
+
+  // Re-backfill invoice breakdown from agreement.source (payments_v1 used flat 5% BYOC).
+  const pending = db
+    .prepare(
+      `SELECT id, home_id, cleaner_id, amount_cents, agreement_id, fee_percent, cleaner_amount_cents
+       FROM invoices
+       WHERE amount_cents IS NOT NULL`
+    )
+    .all();
+
+  const agreementStmt = db.prepare(
+    `SELECT id, source FROM household_cleaner_agreements
+     WHERE household_id = ? AND cleaner_id = ? AND status = 'active'
+     ORDER BY created_at DESC LIMIT 1`
+  );
+  const updateStmt = db.prepare(
+    `UPDATE invoices SET
+      agreement_id = ?,
+      cleaner_amount_cents = ?,
+      bradley_fee_cents = ?,
+      total_amount_cents = ?,
+      fee_type = ?,
+      fee_percent = ?
+     WHERE id = ?`
+  );
+
+  for (const inv of pending) {
+    const agreement = agreementStmt.get(inv.home_id, inv.cleaner_id);
+    const source = agreement?.source === 'match' ? 'match' : 'byoc';
+    const breakdown = calculatePaymentBreakdown({
+      cleanerAmountCents: inv.amount_cents,
+      source,
+    });
+    const needsUpdate =
+      inv.agreement_id !== (agreement?.id ?? null) ||
+      inv.fee_percent !== breakdown.fee_percent;
+    if (!needsUpdate && inv.cleaner_amount_cents != null) continue;
+
+    updateStmt.run(
+      agreement?.id ?? null,
+      breakdown.cleaner_amount_cents,
+      breakdown.bradley_fee_cents,
+      breakdown.total_amount_cents,
+      breakdown.fee_type,
+      breakdown.fee_percent,
+      inv.id
+    );
+  }
+
+  db.prepare(`INSERT INTO _migrations (name) VALUES (?)`).run('payment_monetization_v1');
+}
+
+migratePaymentMonetizationV1();
 
 function boolToInt(value, defaultValue = 0) {
   if (value === undefined || value === null) return defaultValue;
@@ -1014,6 +1197,66 @@ export function updateAdminMatchSuggestion(id, fields) {
   values.push(id);
   db.prepare(`UPDATE admin_match_suggestions SET ${sets.join(', ')} WHERE id = ?`).run(...values);
   return getAdminMatchSuggestionById(id);
+}
+
+/** Active agreement for invoice fee lookup (household_cleaner_agreements.source). */
+export function getActiveHouseholdCleanerAgreement(householdId, cleanerId) {
+  return (
+    db
+      .prepare(
+        `SELECT * FROM household_cleaner_agreements
+         WHERE household_id = ? AND cleaner_id = ? AND status = 'active'
+         ORDER BY created_at DESC LIMIT 1`
+      )
+      .get(householdId, cleanerId) ?? null
+  );
+}
+
+export function getPaymentIntentById(id) {
+  return db.prepare('SELECT * FROM payment_intents WHERE id = ?').get(id) ?? null;
+}
+
+export function updatePaymentIntentStatus(id, status) {
+  db.prepare(
+    `UPDATE payment_intents SET status = ?, updated_at = datetime('now') WHERE id = ?`
+  ).run(status, id);
+  return getPaymentIntentById(id);
+}
+
+/**
+ * Audit row when a platform fee is collected (typically from Stripe webhook).
+ */
+export function createPlatformFee({
+  id,
+  paymentIntentId = null,
+  invoiceId = null,
+  agreementId = null,
+  feeType,
+  feePercent,
+  cleanerAmountCents,
+  feeAmountCents,
+  totalAmountCents,
+  stripeFeeId = null,
+}) {
+  db.prepare(
+    `INSERT INTO platform_fees (
+      id, payment_intent_id, invoice_id, agreement_id,
+      fee_type, fee_percent, cleaner_amount_cents, fee_amount_cents,
+      total_amount_cents, stripe_fee_id
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    id,
+    paymentIntentId,
+    invoiceId,
+    agreementId,
+    feeType,
+    feePercent,
+    cleanerAmountCents,
+    feeAmountCents,
+    totalAmountCents,
+    stripeFeeId
+  );
+  return db.prepare('SELECT * FROM platform_fees WHERE id = ?').get(id);
 }
 
 export default db;

@@ -151,6 +151,8 @@ export function formatAgreementRow(row, { cleanerName } = {}) {
     cleaner_id: row.cleaner_id,
     cleaner_name: cleanerName || 'Cleaner',
     source: row.source,
+    fee_type: row.fee_type ?? (row.source === 'match' ? 'match_fee' : 'byoc_platform_fee'),
+    fee_percent: row.fee_percent ?? (row.source === 'match' ? 10 : 5),
     scope_summary: row.scope_summary || '',
     hourly_rate_cents: row.hourly_rate_cents,
     recurring_estimated_minutes: row.recurring_estimated_minutes,

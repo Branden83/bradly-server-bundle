@@ -11,6 +11,8 @@ Environment=PORT=3847
 Environment=JWT_SECRET=CHANGE_ME_ON_DEPLOY
 Environment=BRADLEY_DB_PATH=/opt/bradley/data/bradley.db
 Environment=ADMIN_EMAILS=brandenthomas@gmail.com,branden.thomas@toweringmedia.com
+# Optional: overrides app_settings.openai_api_key (see docs/ai-api-key-setup.md)
+# Environment=OPENAI_API_KEY=
 ExecStart=/usr/bin/node index.js
 Restart=always
 RestartSec=5

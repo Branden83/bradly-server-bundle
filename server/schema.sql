@@ -8,6 +8,8 @@ CREATE TABLE IF NOT EXISTS users (
   subscription_status TEXT NOT NULL DEFAULT 'trial',
   subscription_trial_ends_at TEXT,
   subscription_expires_at TEXT,
+  stripe_connect_account_id TEXT,
+  stripe_connect_onboarding_complete INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -337,6 +339,52 @@ CREATE INDEX IF NOT EXISTS idx_cleaning_request_tasks_request ON cleaning_reques
 CREATE INDEX IF NOT EXISTS idx_cleaner_proposals_request ON cleaner_proposals(request_id);
 CREATE INDEX IF NOT EXISTS idx_cleaner_proposals_cleaner ON cleaner_proposals(cleaner_id);
 CREATE INDEX IF NOT EXISTS idx_cleaner_proposals_status ON cleaner_proposals(status);
+CREATE TABLE IF NOT EXISTS payment_intents (
+  id TEXT PRIMARY KEY,
+  stripe_payment_intent_id TEXT UNIQUE,
+  invoice_id TEXT REFERENCES invoices(id) ON DELETE SET NULL,
+  agreement_id TEXT REFERENCES household_cleaner_agreements(id) ON DELETE SET NULL,
+  homeowner_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  cleaner_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  cleaner_amount_cents INTEGER NOT NULL,
+  bradley_fee_cents INTEGER NOT NULL,
+  total_amount_cents INTEGER NOT NULL,
+  fee_type TEXT NOT NULL CHECK (fee_type IN ('byoc_platform_fee', 'match_fee')),
+  fee_percent INTEGER NOT NULL CHECK (fee_percent IN (5, 10)),
+  currency TEXT NOT NULL DEFAULT 'usd',
+  status TEXT NOT NULL DEFAULT 'requires_payment_method' CHECK (
+    status IN (
+      'requires_payment_method',
+      'requires_confirmation',
+      'processing',
+      'succeeded',
+      'failed',
+      'canceled'
+    )
+  ),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS platform_fees (
+  id TEXT PRIMARY KEY,
+  payment_intent_id TEXT REFERENCES payment_intents(id) ON DELETE SET NULL,
+  invoice_id TEXT REFERENCES invoices(id) ON DELETE SET NULL,
+  agreement_id TEXT REFERENCES household_cleaner_agreements(id) ON DELETE SET NULL,
+  fee_type TEXT NOT NULL CHECK (fee_type IN ('byoc_platform_fee', 'match_fee')),
+  fee_percent INTEGER NOT NULL CHECK (fee_percent IN (5, 10)),
+  cleaner_amount_cents INTEGER NOT NULL,
+  fee_amount_cents INTEGER NOT NULL,
+  total_amount_cents INTEGER NOT NULL,
+  stripe_fee_id TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_payment_intents_invoice ON payment_intents(invoice_id);
+CREATE INDEX IF NOT EXISTS idx_payment_intents_stripe ON payment_intents(stripe_payment_intent_id);
+CREATE INDEX IF NOT EXISTS idx_platform_fees_payment_intent ON platform_fees(payment_intent_id);
+CREATE INDEX IF NOT EXISTS idx_platform_fees_invoice ON platform_fees(invoice_id);
+
 CREATE INDEX IF NOT EXISTS idx_household_cleaner_agreements_household ON household_cleaner_agreements(household_id);
 CREATE INDEX IF NOT EXISTS idx_household_cleaner_agreements_cleaner ON household_cleaner_agreements(cleaner_id);
 CREATE INDEX IF NOT EXISTS idx_household_cleaner_agreements_status ON household_cleaner_agreements(status);

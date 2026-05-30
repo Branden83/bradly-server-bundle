@@ -7,6 +7,15 @@ import { v4 as uuid } from 'uuid';
 import { getCleanerReminders } from './ai/reminders.js';
 import db from './db.js';
 import { registerMarketplaceRoutes } from './routes/marketplace.js';
+import {
+  buildInvoiceFeeBreakdown,
+  createPaymentIntentForInvoice,
+  fetchInvoiceById,
+  formatInvoiceRow,
+  invoiceHasSucceededPayment,
+  markInvoicePaidFromPayment,
+} from './services/invoiceService.js';
+import { getCleanerConnectStatus, isStripeConfigured } from './services/stripeConnectService.js';
 
 const app = express();
 const PORT = Number(process.env.PORT || 3847);
@@ -1283,7 +1292,7 @@ app.get('/notifications/unread-count', authRequired, (req, res) => {
   res.json({ count: 0 });
 });
 
-// ─── Payment methods (cleaner receive handles) ──────────────────────────────
+// ─── Payment methods (legacy — admin-only fallback; MVP uses Stripe Connect) ─
 
 app.get('/payment-methods/mine', authRequired, (req, res) => {
   const row = db.prepare('SELECT * FROM payment_methods WHERE user_id = ?').get(req.user.id);
@@ -1328,6 +1337,8 @@ app.get('/payment-methods/cleaner/:cleanerId', authRequired, (req, res) => {
 });
 
 app.put('/payment-methods/mine', authRequired, (req, res) => {
+  // Deprecated for MVP checkout — Venmo/Zelle/Cash App/PayPal are not the primary pay flow.
+  // Retained for admin-only manual reconciliation if needed post-MVP.
   if (req.user.role !== 'cleaner') {
     return res.status(403).json({ error: 'Only cleaners can set payment methods' });
   }
@@ -1361,49 +1372,38 @@ app.put('/payment-methods/mine', authRequired, (req, res) => {
   res.json(db.prepare('SELECT * FROM payment_methods WHERE user_id = ?').get(req.user.id));
 });
 
-// ─── Invoices ───────────────────────────────────────────────────────────────
+// ─── Invoices (Stripe Connect primary; webhooks source of truth) ─────────────
 
-function invoiceRow(id) {
-  return db
-    .prepare(
-      `SELECT i.*, u.display_name as cleaner_name, v.scheduled_date as visit_date
-       FROM invoices i
-       JOIN users u ON u.id = i.cleaner_id
-       LEFT JOIN visits v ON v.id = i.visit_id
-       WHERE i.id = ?`
-    )
-    .get(id);
+function listInvoicesForUser(userId, role, home) {
+  const rows =
+    role === 'client'
+      ? db
+          .prepare(
+            `SELECT i.*, u.display_name as cleaner_name, v.scheduled_date as visit_date
+             FROM invoices i
+             JOIN users u ON u.id = i.cleaner_id
+             LEFT JOIN visits v ON v.id = i.visit_id
+             WHERE i.home_id = ?
+             ORDER BY i.created_at DESC LIMIT 50`
+          )
+          .all(home.id)
+      : db
+          .prepare(
+            `SELECT i.*, u.display_name as cleaner_name, v.scheduled_date as visit_date
+             FROM invoices i
+             JOIN users u ON u.id = i.cleaner_id
+             LEFT JOIN visits v ON v.id = i.visit_id
+             WHERE i.cleaner_id = ?
+             ORDER BY i.created_at DESC LIMIT 50`
+          )
+          .all(userId);
+  return rows.map((row) => formatInvoiceRow(row));
 }
 
 app.get('/invoices', authRequired, (req, res) => {
   const home = getHomeForUser(req.user.id);
   if (!home) return res.json([]);
-
-  if (req.user.role === 'client') {
-    const rows = db
-      .prepare(
-        `SELECT i.*, u.display_name as cleaner_name, v.scheduled_date as visit_date
-         FROM invoices i
-         JOIN users u ON u.id = i.cleaner_id
-         LEFT JOIN visits v ON v.id = i.visit_id
-         WHERE i.home_id = ?
-         ORDER BY i.created_at DESC LIMIT 50`
-      )
-      .all(home.id);
-    return res.json(rows);
-  }
-
-  const rows = db
-    .prepare(
-      `SELECT i.*, u.display_name as cleaner_name, v.scheduled_date as visit_date
-       FROM invoices i
-       JOIN users u ON u.id = i.cleaner_id
-       LEFT JOIN visits v ON v.id = i.visit_id
-       WHERE i.cleaner_id = ?
-       ORDER BY i.created_at DESC LIMIT 50`
-    )
-    .all(req.user.id);
-  res.json(rows);
+  res.json(listInvoicesForUser(req.user.id, req.user.role, home));
 });
 
 app.post('/invoices', authRequired, (req, res) => {
@@ -1423,22 +1423,40 @@ app.post('/invoices', authRequired, (req, res) => {
     if (!visit) return res.status(404).json({ error: 'Visit not found' });
   }
 
-  const methods = db.prepare('SELECT * FROM payment_methods WHERE user_id = ?').get(req.user.id);
-  const hasMethod =
-    methods?.venmo_handle || methods?.zelle_contact || methods?.cashapp_handle || methods?.paypal_handle;
-  if (!hasMethod) {
-    return res.status(400).json({ error: 'Add your Venmo, Zelle, or Cash App info first' });
+  const connectStatus = getCleanerConnectStatus(req.user.id);
+  if (!connectStatus.ready) {
+    return res.status(400).json({
+      error: 'Complete Stripe Connect onboarding before sending invoices',
+      code: connectStatus.reason,
+    });
   }
 
+  const breakdown = buildInvoiceFeeBreakdown(amountCents, home.id, req.user.id);
   const id = uuid();
   db.prepare(
-    `INSERT INTO invoices (id, home_id, visit_id, cleaner_id, amount_cents, note, status)
-     VALUES (?, ?, ?, ?, ?, ?, 'sent')`
-  ).run(id, home.id, visitId || null, req.user.id, amountCents, note?.trim() || '');
+    `INSERT INTO invoices (
+      id, home_id, visit_id, cleaner_id, agreement_id,
+      amount_cents, cleaner_amount_cents, bradley_fee_cents, total_amount_cents,
+      fee_type, fee_percent, note, status
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'sent')`
+  ).run(
+    id,
+    home.id,
+    visitId || null,
+    req.user.id,
+    breakdown.agreement_id,
+    breakdown.cleaner_amount_cents,
+    breakdown.cleaner_amount_cents,
+    breakdown.bradley_fee_cents,
+    breakdown.total_amount_cents,
+    breakdown.fee_type,
+    breakdown.fee_percent,
+    note?.trim() || ''
+  );
 
   const ownerId = getOwnerId(home.id);
   const owner = db.prepare('SELECT push_token FROM users WHERE id = ?').get(ownerId);
-  const amount = (amountCents / 100).toFixed(2);
+  const amount = (breakdown.total_amount_cents / 100).toFixed(2);
   const cleaner = db.prepare('SELECT display_name FROM users WHERE id = ?').get(req.user.id);
   void sendExpoPush([owner?.push_token], {
     title: 'New invoice',
@@ -1446,18 +1464,76 @@ app.post('/invoices', authRequired, (req, res) => {
     data: { type: 'invoice', invoiceId: id },
   });
 
-  res.json(invoiceRow(id));
+  res.json(fetchInvoiceById(id));
 });
 
 app.get('/invoices/:id', authRequired, (req, res) => {
-  const invoice = invoiceRow(req.params.id);
+  const invoice = fetchInvoiceById(req.params.id);
   if (!invoice) return res.status(404).json({ error: 'Not found' });
   const home = getHomeForUser(req.user.id);
   if (!home || home.id !== invoice.home_id) {
     return res.status(403).json({ error: 'Not allowed' });
   }
-  const methods = db.prepare('SELECT * FROM payment_methods WHERE user_id = ?').get(invoice.cleaner_id);
-  res.json({ invoice, paymentMethods: methods || {} });
+
+  const payload = {
+    invoice,
+    stripeConfigured: isStripeConfigured(),
+  };
+
+  // Legacy off-platform handles — not exposed in MVP homeowner checkout UX.
+  if (isAdminUser(req.user)) {
+    const methods = db
+      .prepare('SELECT * FROM payment_methods WHERE user_id = ?')
+      .get(invoice.cleaner_id);
+    payload.paymentMethods = methods || {};
+    payload.paymentMethodsNote =
+      'Admin-only fallback. MVP invoices must be paid through Stripe in-app.';
+  }
+
+  res.json(payload);
+});
+
+app.post('/invoices/:id/payment-intent', authRequired, (req, res) => {
+  const invoice = db.prepare('SELECT * FROM invoices WHERE id = ?').get(req.params.id);
+  if (!invoice) return res.status(404).json({ error: 'Not found' });
+
+  const home = getHomeForUser(req.user.id);
+  if (!home || home.id !== invoice.home_id || !isHouseholdClient(req.user.id, home.id)) {
+    return res.status(403).json({ error: 'Only the homeowner can pay invoices' });
+  }
+
+  const connectStatus = getCleanerConnectStatus(invoice.cleaner_id);
+  if (!connectStatus.ready) {
+    return res.status(400).json({
+      error: 'Cleaner must complete Stripe Connect onboarding before receiving payment',
+      code: connectStatus.reason,
+    });
+  }
+
+  const result = createPaymentIntentForInvoice(invoice.id, req.user.id);
+  if (result.error) {
+    return res.status(result.status || 400).json({ error: result.error });
+  }
+
+  const formatted = fetchInvoiceById(invoice.id);
+  res.json({
+    invoice: formatted,
+    paymentIntent: {
+      id: result.paymentIntent.id,
+      stripe_payment_intent_id: result.paymentIntent.stripe_payment_intent_id,
+      status: result.paymentIntent.status,
+      cleaner_amount_cents: result.paymentIntent.cleaner_amount_cents,
+      bradley_fee_cents: result.paymentIntent.bradley_fee_cents,
+      total_amount_cents: result.paymentIntent.total_amount_cents,
+      fee_type: result.paymentIntent.fee_type,
+      fee_percent: result.paymentIntent.fee_percent,
+      cleaner_payout_cents: result.paymentIntent.cleaner_amount_cents,
+      cleaner_payout_display: `$${(result.paymentIntent.cleaner_amount_cents / 100).toFixed(2)}`,
+      client_secret: isStripeConfigured() ? null : null,
+    },
+    stripeConfigured: isStripeConfigured(),
+    created: result.created,
+  });
 });
 
 app.patch('/invoices/:id/paid', authRequired, (req, res) => {
@@ -1470,21 +1546,22 @@ app.patch('/invoices/:id/paid', authRequired, (req, res) => {
   }
 
   const { paidVia } = req.body;
-  if (!paidVia) return res.status(400).json({ error: 'Payment method required' });
 
-  db.prepare(
-    `UPDATE invoices SET status = 'paid', paid_via = ?, paid_at = datetime('now') WHERE id = ?`
-  ).run(paidVia, invoice.id);
+  if (!invoiceHasSucceededPayment(invoice.id)) {
+    if (isAdminUser(req.user) && paidVia) {
+      // Admin-only manual fallback when Stripe/webhooks are unavailable.
+      const updated = markInvoicePaidFromPayment(invoice.id, { paidVia });
+      return res.json(updated);
+    }
+    return res.status(402).json({
+      error: 'Payment required before marking invoice paid',
+      code: 'payment_required',
+      message:
+        'Complete in-app payment through Bradley. Off-platform Venmo/Cash App/Zelle/PayPal is not supported in MVP.',
+    });
+  }
 
-  const cleaner = db.prepare('SELECT push_token FROM users WHERE id = ?').get(invoice.cleaner_id);
-  const amount = (invoice.amount_cents / 100).toFixed(2);
-  void sendExpoPush([cleaner?.push_token], {
-    title: 'Invoice paid',
-    body: `Payment of $${amount} received via ${paidVia}`,
-    data: { type: 'invoice_paid', invoiceId: invoice.id },
-  });
-
-  res.json(invoiceRow(invoice.id));
+  res.json(fetchInvoiceById(invoice.id));
 });
 
 app.patch('/invoices/:id/cancel', authRequired, (req, res) => {
@@ -1497,7 +1574,7 @@ app.patch('/invoices/:id/cancel', authRequired, (req, res) => {
     return res.status(400).json({ error: 'Invoice cannot be cancelled' });
   }
   db.prepare(`UPDATE invoices SET status = 'cancelled' WHERE id = ?`).run(invoice.id);
-  res.json(invoiceRow(invoice.id));
+  res.json(fetchInvoiceById(invoice.id));
 });
 
 // ─── Admin ──────────────────────────────────────────────────────────────────
@@ -1549,6 +1626,10 @@ app.delete('/admin/users/:email', authRequired, requireAdmin, (req, res) => {
   const deleted = deleteUserByEmail(email);
   if (!deleted) return res.status(404).json({ error: 'User not found' });
   res.json({ ok: true });
+});
+
+app.get('/admin/health', authRequired, requireAdmin, (_req, res) => {
+  res.json({ ok: true, service: 'bradley-admin' });
 });
 
 app.get('/admin/settings', authRequired, requireAdmin, (_req, res) => {

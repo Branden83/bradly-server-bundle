@@ -4,3 +4,6 @@ export * as cleanerProfileService from './cleanerProfileService.js';
 export * as cleaningRequestService from './cleaningRequestService.js';
 export * as proposalService from './proposalService.js';
 export * as agreementService from './agreementService.js';
+export * as paymentFeeService from './paymentFeeService.js';
+export * as invoiceService from './invoiceService.js';
+export * as stripeConnectService from './stripeConnectService.js';

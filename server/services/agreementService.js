@@ -2,6 +2,7 @@ import { v4 as uuid } from 'uuid';
 import db from '../db.js';
 import { assertFound, ServiceError } from '../lib/serviceError.js';
 import { formatAgreementRow } from '../lib/marketplaceFormat.js';
+import { feeFieldsForAgreementSource } from './paymentFeeService.js';
 import * as cleaningRequestService from './cleaningRequestService.js';
 
 function buildScopeSummary(tasks) {
@@ -162,14 +163,15 @@ export function createAgreement({
   }
 
   const id = uuid();
+  const feeFields = feeFieldsForAgreementSource(source);
   db.prepare(
     `INSERT INTO household_cleaner_agreements (
       id, household_id, homeowner_id, cleaner_id, accepted_proposal_id, source,
       hourly_rate_cents, recurring_estimated_minutes, recurring_estimated_total_cents,
       first_visit_estimated_minutes, first_visit_estimated_total_cents,
       agreed_frequency, agreed_day, agreed_start_time, agreed_end_time,
-      supplies_included, status
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`
+      supplies_included, fee_type, fee_percent, status
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`
   ).run(
     id,
     householdId,
@@ -186,7 +188,9 @@ export function createAgreement({
     terms.agreed_day,
     terms.agreed_start_time,
     terms.agreed_end_time,
-    terms.supplies_included ? 1 : 0
+    terms.supplies_included ? 1 : 0,
+    feeFields.fee_type,
+    feeFields.fee_percent
   );
 
   return getAgreementById(id);
