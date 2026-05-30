@@ -54,4 +54,4 @@ cp /opt/bradley/deploy/Caddyfile /etc/caddy/Caddyfile
 systemctl enable caddy
 systemctl restart caddy
 
-curl -sf http://127.0.0.1:443/health && echo " bradley-api ready"
+curl -sf https://34-134-19-51.sslip.io/health && echo " bradley-api ready"

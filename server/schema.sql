@@ -3,9 +3,16 @@ CREATE TABLE IF NOT EXISTS users (
   email TEXT UNIQUE NOT NULL,
   password_hash TEXT NOT NULL,
   display_name TEXT NOT NULL,
-  role TEXT NOT NULL CHECK (role IN ('client', 'cleaner')),
+  role TEXT NOT NULL CHECK (role IN ('client', 'cleaner', 'admin')),
   push_token TEXT,
+  subscription_status TEXT NOT NULL DEFAULT 'trial',
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS app_settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS homes (
@@ -109,3 +116,16 @@ CREATE TABLE IF NOT EXISTS invoices (
 
 CREATE INDEX IF NOT EXISTS idx_invoices_home ON invoices(home_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_invoices_cleaner ON invoices(cleaner_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS visit_feedback (
+  id TEXT PRIMARY KEY,
+  visit_id TEXT NOT NULL REFERENCES visits(id) ON DELETE CASCADE,
+  home_id TEXT NOT NULL REFERENCES homes(id) ON DELETE CASCADE,
+  author_id TEXT NOT NULL REFERENCES users(id),
+  went_well TEXT NOT NULL DEFAULT '',
+  needs_improvement TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_visit_feedback_home ON visit_feedback(home_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_visit_feedback_visit ON visit_feedback(visit_id);

@@ -4,12 +4,57 @@ import express from 'express';
 import jwt from 'jsonwebtoken';
 import { networkInterfaces } from 'os';
 import { v4 as uuid } from 'uuid';
+import { getCleanerReminders } from './ai/reminders.js';
 import db from './db.js';
 
 const app = express();
 const PORT = Number(process.env.PORT || 3847);
 const JWT_SECRET = process.env.JWT_SECRET || 'bradley-dev-secret-change-in-production';
 const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
+const DEFAULT_ADMIN_EMAILS = 'brandenthomas@gmail.com,branden.thomas@toweringmedia.com';
+const SENSITIVE_SETTING_KEYS = new Set(['openai_api_key']);
+
+function parseAdminEmails() {
+  return (process.env.ADMIN_EMAILS || DEFAULT_ADMIN_EMAILS)
+    .split(',')
+    .map((e) => e.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function isAdminUser(jwtUser) {
+  if (!jwtUser?.id) return false;
+  const row = db.prepare('SELECT email, role FROM users WHERE id = ?').get(jwtUser.id);
+  if (!row) return false;
+  if (row.role === 'admin') return true;
+  return parseAdminEmails().includes(row.email.toLowerCase());
+}
+
+function requireAdmin(req, res, next) {
+  if (!isAdminUser(req.user)) {
+    return res.status(403).json({ error: 'Admin access required' });
+  }
+  next();
+}
+
+function maskSettingValue(key, value) {
+  if (!value) return value ?? '';
+  if (SENSITIVE_SETTING_KEYS.has(key) || key.includes('api_key') || key.includes('secret')) {
+    return value.length > 4 ? `***${value.slice(-4)}` : '***';
+  }
+  return value;
+}
+
+function getSetting(key) {
+  const row = db.prepare('SELECT value FROM app_settings WHERE key = ?').get(key);
+  return row?.value ?? '';
+}
+
+function setSetting(key, value) {
+  db.prepare(
+    `INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, datetime('now'))
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')`
+  ).run(key, value ?? '');
+}
 
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
@@ -244,6 +289,9 @@ app.post('/auth/register', (req, res) => {
   if (!email || !password || !displayName || !['client', 'cleaner'].includes(role)) {
     return res.status(400).json({ error: 'Invalid registration data' });
   }
+  if (role === 'admin') {
+    return res.status(400).json({ error: 'Invalid registration data' });
+  }
   const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(email.toLowerCase());
   if (existing) return res.status(409).json({ error: 'Email already registered' });
 
@@ -256,9 +304,8 @@ app.post('/auth/register', (req, res) => {
   const token = jwt.sign({ id, email: email.toLowerCase(), role }, JWT_SECRET, { expiresIn: '30d' });
   res.json({
     token,
-    user: { id, email: email.toLowerCase(), displayName, role },
+    user: { id, email: email.toLowerCase(), displayName, role, isAdmin: isAdminUser({ id }) },
   });
-});
 
 app.post('/auth/login', (req, res) => {
   const { email, password } = req.body;
@@ -278,14 +325,17 @@ app.post('/auth/login', (req, res) => {
       email: user.email,
       displayName: user.display_name,
       role: user.role,
+      isAdmin: isAdminUser({ id: user.id }),
     },
   });
 });
 
 app.get('/auth/me', auth, (req, res) => {
-  const user = db.prepare('SELECT id, email, display_name, role, push_token FROM users WHERE id = ?').get(
-    req.user.id
-  );
+  const user = db
+    .prepare(
+      'SELECT id, email, display_name, role, push_token, subscription_status FROM users WHERE id = ?'
+    )
+    .get(req.user.id);
   if (!user) return res.status(404).json({ error: 'User not found' });
   res.json({
     id: user.id,
@@ -293,6 +343,8 @@ app.get('/auth/me', auth, (req, res) => {
     displayName: user.display_name,
     role: user.role,
     pushToken: user.push_token,
+    subscriptionStatus: user.subscription_status,
+    isAdmin: isAdminUser(req.user),
   });
 });
 
@@ -519,7 +571,7 @@ app.patch('/tasks/:id', auth, (req, res) => {
 
 // ─── Visits ─────────────────────────────────────────────────────────────────
 
-app.get('/visits/upcoming', auth, (req, res) => {
+app.get('/visits/upcoming', auth, async (req, res) => {
   const home = getHomeForUser(req.user.id);
   if (!home) return res.json(null);
 
@@ -540,7 +592,23 @@ app.get('/visits/upcoming', auth, (req, res) => {
     return { ...t, questions };
   });
 
-  res.json({ visit, tasks: tasksWithQuestions, home });
+  const payload = { visit, tasks: tasksWithQuestions, home };
+
+  if (req.user.role === 'cleaner') {
+    try {
+      payload.cleanerReminders = await getCleanerReminders({
+        db,
+        homeId: home.id,
+        visitId: visit.id,
+        getSetting,
+      });
+    } catch (err) {
+      console.error('[visits/upcoming] cleanerReminders failed:', err);
+      payload.cleanerReminders = [];
+    }
+  }
+
+  res.json(payload);
 });
 
 app.get('/visits/history', auth, (req, res) => {
@@ -653,6 +721,82 @@ app.post('/visits/:id/complete', auth, (req, res) => {
     visit: db.prepare('SELECT * FROM visits WHERE id = ?').get(visit.id),
     summary: { done, skipped, pending, total: tasks.length },
   });
+});
+
+app.post('/visits/:id/feedback', auth, (req, res) => {
+  const visit = db.prepare('SELECT * FROM visits WHERE id = ?').get(req.params.id);
+  if (!visit) return res.status(404).json({ error: 'Not found' });
+  if (visit.status !== 'completed') {
+    return res.status(400).json({ error: 'Visit must be completed before feedback' });
+  }
+  if (!isHouseholdClient(req.user.id, visit.home_id)) {
+    return res.status(403).json({ error: 'Only household clients can submit feedback' });
+  }
+
+  const wentWell = (req.body.wentWell ?? req.body.went_well ?? '').trim();
+  const needsImprovement = (req.body.needsImprovement ?? req.body.needs_improvement ?? '').trim();
+  if (!wentWell && !needsImprovement) {
+    return res.status(400).json({ error: 'Enter at least one comment' });
+  }
+
+  const existing = db
+    .prepare('SELECT id FROM visit_feedback WHERE visit_id = ? AND author_id = ?')
+    .get(visit.id, req.user.id);
+  if (existing) {
+    return res.status(409).json({ error: 'You already submitted feedback for this visit' });
+  }
+
+  const id = uuid();
+  db.prepare(
+    `INSERT INTO visit_feedback (id, visit_id, home_id, author_id, went_well, needs_improvement)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  ).run(id, visit.id, visit.home_id, req.user.id, wentWell, needsImprovement);
+
+  const cleaners = db
+    .prepare(
+      `SELECT u.push_token FROM users u
+       JOIN home_members hm ON hm.user_id = u.id
+       WHERE hm.home_id = ? AND hm.role = 'cleaner'`
+    )
+    .all(visit.home_id);
+  const author = db.prepare('SELECT display_name FROM users WHERE id = ?').get(req.user.id);
+  void sendExpoPush(
+    cleaners.map((c) => c.push_token),
+    {
+      title: 'Visit feedback',
+      body: `${author?.display_name || 'Client'} shared feedback on today's visit.`,
+      data: { type: 'visit_feedback', visitId: visit.id, feedbackId: id },
+    }
+  );
+
+  const row = db
+    .prepare(
+      `SELECT f.*, u.display_name as author_name, v.scheduled_date as visit_date
+       FROM visit_feedback f
+       JOIN users u ON u.id = f.author_id
+       JOIN visits v ON v.id = f.visit_id
+       WHERE f.id = ?`
+    )
+    .get(id);
+  res.status(201).json(row);
+});
+
+app.get('/homes/:homeId/feedback', auth, (req, res) => {
+  const role = getUserHomeRole(req.user.id, req.params.homeId);
+  if (!role) return res.status(403).json({ error: 'Not a member of this home' });
+
+  const feedback = db
+    .prepare(
+      `SELECT f.*, u.display_name as author_name, v.scheduled_date as visit_date
+       FROM visit_feedback f
+       JOIN users u ON u.id = f.author_id
+       JOIN visits v ON v.id = f.visit_id
+       WHERE f.home_id = ?
+       ORDER BY f.created_at DESC
+       LIMIT 50`
+    )
+    .all(req.params.homeId);
+  res.json({ feedback });
 });
 
 // ─── Questions ──────────────────────────────────────────────────────────────
@@ -950,6 +1094,85 @@ app.patch('/invoices/:id/cancel', auth, (req, res) => {
   }
   db.prepare(`UPDATE invoices SET status = 'cancelled' WHERE id = ?`).run(invoice.id);
   res.json(invoiceRow(invoice.id));
+});
+
+// ─── Admin ──────────────────────────────────────────────────────────────────
+
+function deleteUserByEmail(email) {
+  const user = db.prepare('SELECT id FROM users WHERE email = ?').get(email.toLowerCase());
+  if (!user) return false;
+
+  const ownedHomes = db.prepare('SELECT id FROM homes WHERE owner_id = ?').all(user.id);
+  for (const home of ownedHomes) {
+    db.prepare('DELETE FROM homes WHERE id = ?').run(home.id);
+  }
+
+  db.prepare('DELETE FROM home_members WHERE user_id = ?').run(user.id);
+  db.prepare('DELETE FROM task_questions WHERE author_id = ?').run(user.id);
+  db.prepare('DELETE FROM visit_feedback WHERE author_id = ?').run(user.id);
+  db.prepare('DELETE FROM invoices WHERE cleaner_id = ?').run(user.id);
+  db.prepare('DELETE FROM payment_methods WHERE user_id = ?').run(user.id);
+  db.prepare('UPDATE invites SET used_by = NULL WHERE used_by = ?').run(user.id);
+  db.prepare('DELETE FROM users WHERE id = ?').run(user.id);
+  return true;
+}
+
+app.get('/admin/users', auth, requireAdmin, (_req, res) => {
+  const users = db
+    .prepare(
+      `SELECT id, email, display_name, role, subscription_status, created_at
+       FROM users ORDER BY created_at DESC`
+    )
+    .all();
+  res.json({
+    users: users.map((u) => ({
+      id: u.id,
+      email: u.email,
+      displayName: u.display_name,
+      role: u.role,
+      subscriptionStatus: u.subscription_status,
+      createdAt: u.created_at,
+    })),
+  });
+});
+
+app.delete('/admin/users/:email', auth, requireAdmin, (req, res) => {
+  const email = decodeURIComponent(req.params.email || '').toLowerCase();
+  if (!email) return res.status(400).json({ error: 'Email required' });
+  if (email === req.user.email?.toLowerCase()) {
+    return res.status(400).json({ error: 'Cannot delete your own account' });
+  }
+  const deleted = deleteUserByEmail(email);
+  if (!deleted) return res.status(404).json({ error: 'User not found' });
+  res.json({ ok: true });
+});
+
+app.get('/admin/settings', auth, requireAdmin, (_req, res) => {
+  const rows = db.prepare('SELECT key, value, updated_at FROM app_settings ORDER BY key').all();
+  const settings = {};
+  for (const row of rows) {
+    settings[row.key] = maskSettingValue(row.key, row.value);
+  }
+  res.json({ settings });
+});
+
+app.put('/admin/settings', auth, requireAdmin, (req, res) => {
+  const body = req.body || {};
+  if (typeof body !== 'object' || Array.isArray(body)) {
+    return res.status(400).json({ error: 'Invalid settings body' });
+  }
+  for (const [key, value] of Object.entries(body)) {
+    if (!key || typeof key !== 'string') continue;
+    if (typeof value !== 'string') continue;
+    if (value.startsWith('***') && SENSITIVE_SETTING_KEYS.has(key)) continue;
+    setSetting(key, value);
+  }
+  const rows = db.prepare('SELECT key, value FROM app_settings ORDER BY key').all();
+  const settings = {};
+  for (const row of rows) {
+    settings[row.key] = maskSettingValue(row.key, row.value);
+  }
+  res.json({ settings });
 });
 
 app.get('/health', (_req, res) => {
