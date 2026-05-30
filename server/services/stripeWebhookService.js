@@ -1,10 +1,8 @@
 import { getStripeClient } from '../lib/stripeClient.js';
 import { getStripeWebhookSecret } from '../lib/stripeConfig.js';
-import db, {
-  getPaymentIntentByStripeId,
-  recordStripeWebhookEvent,
-} from '../db.js';
+import db, { recordStripeWebhookEvent } from '../db.js';
 import { markInvoicePaidFromPayment } from './invoiceService.js';
+import { resolvePaymentIntentRowForWebhook } from './stripePaymentService.js';
 import { syncConnectStatusFromStripeAccount } from './stripeConnectService.js';
 
 /**
@@ -65,7 +63,7 @@ export async function handleStripeWebhookRequest(req) {
  * @param {import('stripe').Stripe.PaymentIntent} paymentIntent
  */
 async function handlePaymentIntentSucceeded(paymentIntent) {
-  const row = getPaymentIntentByStripeId(paymentIntent.id);
+  const row = resolvePaymentIntentRowForWebhook(paymentIntent);
   if (!row) {
     console.warn('[stripe webhook] payment_intent.succeeded: unknown PI', paymentIntent.id);
     return;

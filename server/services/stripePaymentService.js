@@ -22,6 +22,48 @@ function updatePaymentIntentStripeId(internalId, stripePaymentIntentId) {
   ).run(stripePaymentIntentId, internalId);
 }
 
+/**
+ * Match a Stripe PaymentIntent to our DB row when stripe_payment_intent_id is still a stub
+ * (Checkout often has no payment_intent id until the customer pays).
+ * @param {{ id: string, metadata?: Record<string, string> }} stripePaymentIntent
+ * @returns {object | null}
+ */
+export function resolvePaymentIntentRowForWebhook(stripePaymentIntent) {
+  const byStripeId = db
+    .prepare('SELECT * FROM payment_intents WHERE stripe_payment_intent_id = ?')
+    .get(stripePaymentIntent.id);
+  if (byStripeId) return byStripeId;
+
+  const syncStripeId = (row) => {
+    if (
+      row &&
+      (isStubStripePaymentIntentId(row.stripe_payment_intent_id) ||
+        row.stripe_payment_intent_id !== stripePaymentIntent.id)
+    ) {
+      updatePaymentIntentStripeId(row.id, stripePaymentIntent.id);
+      return db.prepare('SELECT * FROM payment_intents WHERE id = ?').get(row.id);
+    }
+    return row;
+  };
+
+  const internalId = stripePaymentIntent.metadata?.bradley_payment_intent_id;
+  if (internalId) {
+    const row = db.prepare('SELECT * FROM payment_intents WHERE id = ?').get(internalId);
+    if (row) return syncStripeId(row);
+  }
+
+  const invoiceId = stripePaymentIntent.metadata?.invoice_id;
+  if (invoiceId) {
+    const invoice = db.prepare('SELECT payment_intent_id FROM invoices WHERE id = ?').get(invoiceId);
+    if (invoice?.payment_intent_id) {
+      const row = db.prepare('SELECT * FROM payment_intents WHERE id = ?').get(invoice.payment_intent_id);
+      if (row) return syncStripeId(row);
+    }
+  }
+
+  return null;
+}
+
 function paymentIntentMetadata(invoice, internalPaymentIntentId) {
   return {
     invoice_id: invoice.id,
