@@ -6,6 +6,7 @@ import { networkInterfaces } from 'os';
 import { v4 as uuid } from 'uuid';
 import { getCleanerReminders } from './ai/reminders.js';
 import db from './db.js';
+import { registerMarketplaceRoutes } from './routes/marketplace.js';
 
 const app = express();
 const PORT = Number(process.env.PORT || 3847);
@@ -1577,6 +1578,8 @@ app.put('/admin/settings', authRequired, requireAdmin, (req, res) => {
   }
   res.json({ settings });
 });
+
+registerMarketplaceRoutes(app, { auth, authRequired, requireAdmin });
 
 app.get('/health', (_req, res) => {
   res.json({ ok: true, service: 'bradley-api' });
