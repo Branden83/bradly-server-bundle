@@ -194,6 +194,36 @@ function ensureVisit(homeId, scheduledDate) {
   return visit;
 }
 
+function syncTemplateToUpcomingVisit(homeId, template, roomName) {
+  const home = db.prepare('SELECT * FROM homes WHERE id = ?').get(homeId);
+  if (!home) return;
+
+  const date = nextVisitDate(home);
+  const visit = db
+    .prepare('SELECT * FROM visits WHERE home_id = ? AND scheduled_date = ?')
+    .get(homeId, date);
+  if (!visit || visit.status === 'completed') return;
+  if (!isTaskDue(template, new Date(date))) return;
+
+  const existing = db
+    .prepare('SELECT id FROM visit_tasks WHERE visit_id = ? AND task_template_id = ?')
+    .get(visit.id, template.id);
+  if (existing) return;
+
+  db.prepare(
+    `INSERT INTO visit_tasks (id, visit_id, task_template_id, room_name, title, instructions, cadence, status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')`
+  ).run(
+    uuid(),
+    visit.id,
+    template.id,
+    roomName,
+    template.title,
+    template.instructions,
+    template.cadence
+  );
+}
+
 function nextVisitDate(home) {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
@@ -453,7 +483,9 @@ app.post('/rooms/:roomId/tasks', auth, (req, res) => {
   db.prepare(
     'INSERT INTO task_templates (id, room_id, title, instructions, cadence) VALUES (?, ?, ?, ?, ?)'
   ).run(id, room.id, title, instructions || '', cadence);
-  res.json(db.prepare('SELECT * FROM task_templates WHERE id = ?').get(id));
+  const template = db.prepare('SELECT * FROM task_templates WHERE id = ?').get(id);
+  syncTemplateToUpcomingVisit(room.home_id, template, room.name);
+  res.json(template);
 });
 
 app.patch('/tasks/:id', auth, (req, res) => {
